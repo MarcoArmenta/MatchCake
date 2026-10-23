@@ -51,3 +51,6 @@ The theory documents under `docs/` are read through GitHub's markdown viewer. It
 - Inside a ` ```math ` fence, never end a source line with the `\\` row separator: GitHub appends a spurious third backslash to a line-final `\\`, breaking `aligned`/`cases`. Put `\\` at the **start** of the continuation line instead (e.g. a line beginning `\\ &= ...`). A `\\` in the middle of a single source line (as in one-line `\begin{pmatrix}...\\...\end{pmatrix}`) is fine.
 
 These same files are also built by Sphinx (`myst_nb`), whose `dollarmath` expects `$...$` / `$$...$$` and would break on the GitHub forms. A `source-read` hook in `sphinx/source/conf.py` (`github_math_to_myst`) rewrites `` $`...`$ `` to `$...$` and ` ```math ` fences to `$$...$$` at build time, so the source stays GitHub-flavored while Sphinx still renders it. Keep that hook in sync if the GitHub math conventions change.
+
+# Feature branches
+- `partial-trace-mixed-state` (on the fork `MarcoArmenta/MatchCake`, not merged upstream): adds `NonInteractingFermionicDevice.partial_trace`, `matchcake.states.MixedGaussianState` and `matchcake.utils.covariance`. Read `PARTIAL_TRACE_FEATURE_NOTES.md` at the repository root before working on it; it records the design decisions, the verification done and the macOS environment workaround.
