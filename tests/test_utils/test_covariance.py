@@ -14,6 +14,8 @@ from matchcake.utils.covariance import (
 from ..configs import (
     ATOL_MATRIX_COMPARISON,
     ATOL_SCALAR_COMPARISON,
+    GRADCHECK_ATOL,
+    GRADCHECK_EPS,
     RTOL_MATRIX_COMPARISON,
     RTOL_SCALAR_COMPARISON,
     TEST_SEED,
@@ -40,7 +42,7 @@ class TestCovariance:
         rotation = SingleParticleTransitionMatrixOperation.random_params(
             batch_size=batch_size, wires=list(range(n_modes)), seed=seed
         ).real
-        block = block_diagonal_covariance(polarizations)
+        block = np.asarray(block_diagonal_covariance(polarizations))
         return np.einsum("...ij,...ik,...kl->...jl", rotation, block, rotation)
 
     @staticmethod
@@ -182,7 +184,9 @@ class TestCovariance:
             sptm, polarizations = block_diagonalize_covariance(antisymmetric)
             return self.reconstruct(sptm, polarizations)
 
-        assert torch.autograd.gradcheck(reconstruction, (covariance,), eps=1e-6, atol=1e-5, raise_exception=True)
+        assert torch.autograd.gradcheck(
+            reconstruction, (covariance,), eps=GRADCHECK_EPS, atol=GRADCHECK_ATOL, raise_exception=True
+        )
 
     def test_block_diagonalize_covariance_gradient_of_gauge_invariant_loss(self):
         covariance = torch.tensor(self.random_covariance(3, TEST_SEED + 5), requires_grad=True)
@@ -194,7 +198,9 @@ class TestCovariance:
             evolved = sptm.mT @ block_diagonal_covariance(polarizations) @ sptm
             return torch.sum(weight * evolved) + torch.sum(polarizations**2)
 
-        assert torch.autograd.gradcheck(loss, (covariance,), eps=1e-6, atol=1e-5, raise_exception=True)
+        assert torch.autograd.gradcheck(
+            loss, (covariance,), eps=GRADCHECK_EPS, atol=GRADCHECK_ATOL, raise_exception=True
+        )
 
     def test_block_diagonalize_covariance_gradient_at_pure_degenerate_point(self):
         # Every mode of a pure state has polarization +-1, a degenerate point of the decomposition. Along the
@@ -214,7 +220,7 @@ class TestCovariance:
             return torch.sum(weight * evolved)
 
         angles = torch.tensor(np.random.default_rng(TEST_SEED + 1).normal(size=15), requires_grad=True)
-        assert torch.autograd.gradcheck(loss, (angles,), eps=1e-6, atol=1e-5, raise_exception=True)
+        assert torch.autograd.gradcheck(loss, (angles,), eps=GRADCHECK_EPS, atol=GRADCHECK_ATOL, raise_exception=True)
 
     def test_block_diagonalize_covariance_gradient_projects_gauge_directions(self):
         # The polarization gradient alone must map to a block-diagonal gradient in the rotated frame.
@@ -227,6 +233,32 @@ class TestCovariance:
             expected[2 * mode, 2 * mode + 1] = -0.5 * (mode + 1)
             expected[2 * mode + 1, 2 * mode] = 0.5 * (mode + 1)
         np.testing.assert_allclose(rotated, expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON)
+
+    def test_block_diagonal_covariance_promotes_integer_polarizations(self):
+        covariance = block_diagonal_covariance([1, 0, -1])
+        assert np.issubdtype(covariance.dtype, np.floating)
+        np.testing.assert_allclose(covariance, block_diagonal_covariance([1.0, 0.0, -1.0]), atol=ATOL_MATRIX_COMPARISON)
+
+    def test_block_diagonalize_covariance_promotes_integer_input(self):
+        integer_covariance = np.array([[0, -1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
+        sptm, polarizations = block_diagonalize_covariance(integer_covariance)
+        assert np.issubdtype(sptm.dtype, np.floating)
+        assert np.issubdtype(polarizations.dtype, np.floating)
+        np.testing.assert_allclose(
+            self.reconstruct(sptm, polarizations), integer_covariance, atol=ATOL_MATRIX_COMPARISON
+        )
+
+    def test_block_diagonalize_covariance_returns_real_for_complex_input(self):
+        real_covariance = self.random_covariance(2, TEST_SEED + 7)
+        sptm, polarizations = block_diagonalize_covariance(torch.tensor(real_covariance).to(torch.complex128))
+        assert sptm.dtype == torch.float64
+        assert polarizations.dtype == torch.float64
+        np.testing.assert_allclose(
+            self.reconstruct(sptm, polarizations).numpy(),
+            real_covariance,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
 
     def test_degeneracy_atol_is_small(self):
         assert 0.0 < DEGENERACY_ATOL < ATOL_MATRIX_COMPARISON

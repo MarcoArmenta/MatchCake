@@ -38,8 +38,9 @@ class MixedGaussianState:
     The state lives on ``m`` wires and is fully characterized by the real antisymmetric matrix
     :math:`\Lambda_{\mu\nu} = i\,\mathrm{Tr}[\rho\, c_\mu c_\nu]` (:math:`\mu \neq \nu`) built from the
     Jordan-Wigner Majorana operators :math:`c_{2k} = Z_{<k} X_k` and :math:`c_{2k+1} = Z_{<k} Y_k` of the
-    wires of the state. Such a state is what the partial trace of a matchgate circuit produces: see
-    :meth:`~matchcake.devices.nif_device.NonInteractingFermionicDevice.partial_trace`.
+    wires of the state. Such a state arises, for instance, as the reduced state of a matchgate circuit on a
+    subset of its wires: its covariance matrix is the principal submatrix of the circuit's covariance matrix on
+    the Majorana indices of the kept wires.
 
     Block-diagonalizing the covariance matrix with :func:`~matchcake.utils.covariance.block_diagonalize_covariance`,
 
@@ -96,7 +97,6 @@ class MixedGaussianState:
 
     DEFAULT_ATOL = 1e-8
     ANTISYMMETRY_ATOL = 1e-6
-    DEFAULT_SAMPLING_STRATEGY = NonInteractingFermionicDevice.DEFAULT_SAMPLING_STRATEGY
 
     @staticmethod
     def majorana_indices(wire_positions: Iterable[int]) -> np.ndarray:
@@ -190,8 +190,10 @@ class MixedGaussianState:
         self._covariance_matrix = covariance_matrix
         self._wires = wires
         self._source_wires = wires if source_wires is None else Wires(source_wires)
-        self.atol = float(atol)
+        self._atol = float(atol)
         self.device_kwargs: Dict[str, Any] = dict(device_kwargs or {})
+        if "shots" in self.device_kwargs:
+            raise ValueError("device_kwargs cannot contain 'shots': pass the number of shots to execute or sample.")
 
     def __repr__(self) -> str:
         return (
@@ -294,7 +296,8 @@ class MixedGaussianState:
         :param operations: Operations of the circuit, acting on the wires of the state. State preparations
             are not allowed.
         :type operations: Iterable[Operation]
-        :param device_kwargs: Overrides of the device keyword arguments of the state.
+        :param device_kwargs: Overrides of the device keyword arguments of the state. The evolved state carries
+            them, so that its own readouts use the same settings.
         :return: The evolved state, on the same wires.
         :rtype: MixedGaussianState
         """
@@ -308,7 +311,12 @@ class MixedGaussianState:
         else:
             circuit_sptm = convert_and_cast_like(circuit_sptm, covariance)
         evolved = qml.math.einsum("...ij,...ik,...kl->...jl", circuit_sptm, covariance, circuit_sptm)
-        return self._new(evolved, wires=self.wires, source_wires=self.source_wires)
+        return self._new(
+            evolved,
+            wires=self.wires,
+            source_wires=self.source_wires,
+            device_kwargs={**self.device_kwargs, **device_kwargs},
+        )
 
     def execute(
         self,
@@ -372,6 +380,8 @@ class MixedGaussianState:
             raise ValueError(f"Unknown execution mode {mode!r}. Use 'parallel', 'sequential' or 'direct'.")
         operations = self._check_operations(operations)
         merged_device_kwargs = {**self.device_kwargs, **(device_kwargs or {})}
+        if "shots" in merged_device_kwargs:
+            raise ValueError("Pass the number of shots with the shots argument of execute, not through device_kwargs.")
 
         if shots is not None and output_type != "samples":
             samples = cast(
@@ -535,7 +545,7 @@ class MixedGaussianState:
         source_wires = [self.source_wires.tolist()[position] for position in positions]
         return self._new(covariance, wires=reduced_wires, source_wires=source_wires)
 
-    def sample(self, shots: Optional[int], sampling_strategy: Optional[str] = None) -> np.ndarray:
+    def sample(self, shots: Optional[int], sampling_strategy: Optional[str] = None, **device_kwargs) -> np.ndarray:
         r"""
         Draw computational-basis samples from the state.
 
@@ -544,17 +554,19 @@ class MixedGaussianState:
 
         :param shots: Number of samples.
         :type shots: Optional[int]
-        :param sampling_strategy: Name of the sampling strategy. Defaults to the device default.
+        :param sampling_strategy: Name of the sampling strategy. Defaults to the ``sampling_strategy`` of the
+            device keyword arguments, then to the device default.
         :type sampling_strategy: Optional[str]
+        :param device_kwargs: Overrides of the device keyword arguments of the state.
         :return: Integer samples of shape ``(shots, m)`` or ``(shots, B, m)``.
         :rtype: np.ndarray
         """
         if shots is None:
             raise ValueError("The number of shots must be specified to generate samples.")
-        device = self._make_device(shots=shots)
-        strategy = get_sampling_strategy(sampling_strategy or self.DEFAULT_SAMPLING_STRATEGY)
+        device = self._make_device(shots=shots, **device_kwargs)
+        strategy = device.sampling_strategy if sampling_strategy is None else get_sampling_strategy(sampling_strategy)
         return np.asarray(
-            strategy.batch_generate_samples(device, self._states_probability, show_progress=False)
+            strategy.batch_generate_samples(device, self._states_probability_at_positions, show_progress=False)
         ).astype(int)
 
     def _check_operations(self, operations: Iterable[Operation]) -> List[Operation]:
@@ -666,11 +678,22 @@ class MixedGaussianState:
         :param device_kwargs: Overrides of the device keyword arguments of the state.
         :return: The device.
         :rtype: NonInteractingFermionicDevice
+        :raises ValueError: If the state has a single wire, which the device does not support.
         """
+        if self.num_wires < 2:
+            raise ValueError(
+                f"A {type(self).__name__} on {self.num_wires} wire cannot create a NonInteractingFermionicDevice, "
+                f"which requires at least two wires: evolve, execute and sample are not available on it, while "
+                f"expval, probs, entropy and purity are."
+            )
         return NonInteractingFermionicDevice(wires=self.wires, **{**self.device_kwargs, **device_kwargs})
 
     def _new(
-        self, covariance_matrix: TensorLike, wires: Optional[WiresLike], source_wires: Optional[WiresLike]
+        self,
+        covariance_matrix: TensorLike,
+        wires: Optional[WiresLike],
+        source_wires: Optional[WiresLike],
+        device_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "MixedGaussianState":
         """Build a state sharing the settings of this one.
 
@@ -680,6 +703,8 @@ class MixedGaussianState:
         :type wires: Optional[WiresLike]
         :param source_wires: Source wires of the new state.
         :type source_wires: Optional[WiresLike]
+        :param device_kwargs: Device keyword arguments of the new state. Defaults to those of this state.
+        :type device_kwargs: Optional[Dict[str, Any]]
         :return: The new state.
         :rtype: MixedGaussianState
         """
@@ -687,7 +712,7 @@ class MixedGaussianState:
             covariance_matrix,
             wires=wires,
             atol=self.atol,
-            device_kwargs=self.device_kwargs,
+            device_kwargs=self.device_kwargs if device_kwargs is None else device_kwargs,
             source_wires=source_wires,
         )
 
@@ -766,6 +791,24 @@ class MixedGaussianState:
             pfaffian_chunk_size=self.device_kwargs.get("pfaffian_chunk_size", None),
         )
 
+    def _states_probability_at_positions(
+        self, target_binary_states: TensorLike, wire_positions: WiresLike
+    ) -> TensorLike:
+        """Probabilities of basis outcomes on the wires at the given positions, for the sampling strategies.
+
+        The sampling strategies address wires by their position in the wire list of the device, not by their
+        label; this callback maps the positions to the labels of the state.
+
+        :param target_binary_states: Outcomes of shape ``(k,)`` or ``(n_outcomes, k)``.
+        :type target_binary_states: TensorLike
+        :param wire_positions: Positions of the measured wires in :attr:`wires`.
+        :type wire_positions: WiresLike
+        :return: Probabilities of shape ``(...)`` or ``(n_outcomes, ...)``.
+        :rtype: TensorLike
+        """
+        labels = [self.wires[int(position)] for position in Wires(wire_positions).tolist()]
+        return self._states_probability(target_binary_states, labels)
+
     def _mixed_combinations(self) -> np.ndarray:
         """Every assignment of the bits of the mixed modes, in lexicographic order.
 
@@ -774,6 +817,17 @@ class MixedGaussianState:
         """
         num_mixed = self.num_mixed_modes
         return np.array(list(itertools.product([0, 1], repeat=num_mixed)), dtype=int).reshape(2**num_mixed, num_mixed)
+
+    @property
+    def atol(self) -> float:
+        """The purity tolerance: a mode with :math:`|\\lambda_j| \\geq 1 - \\text{atol}` is treated as pure.
+
+        It is fixed at construction because the purity classification is cached.
+
+        :return: The tolerance.
+        :rtype: float
+        """
+        return self._atol
 
     @cached_property
     def basis_states(self) -> np.ndarray:

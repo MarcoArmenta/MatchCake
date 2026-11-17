@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 import pennylane as qml
 import pytest
@@ -106,6 +108,26 @@ class TestMixedGaussianState:
         """
         return np.asarray(qml.matrix(qml.tape.QuantumScript(operations), wire_order=range(n_wires)))
 
+    @staticmethod
+    def reduced_from_device(device: NonInteractingFermionicDevice, traced_wires) -> MixedGaussianState:
+        """Reduced state of the device on the wires not in ``traced_wires``, relabeled from zero.
+
+        The covariance matrix of the reduced state is the principal submatrix of the device's covariance matrix on
+        the Majorana indices of the kept wires.
+
+        :param device: A device whose circuit has been applied.
+        :type device: NonInteractingFermionicDevice
+        :param traced_wires: Wires to trace out.
+        :type traced_wires: Iterable[int]
+        :return: The reduced state.
+        :rtype: MixedGaussianState
+        """
+        kept = [wire for wire in range(len(device.wires)) if wire not in traced_wires]
+        indices = MixedGaussianState.majorana_indices(kept)
+        covariance_matrix: Any = device.covariance_matrix
+        covariance = covariance_matrix[..., indices[:, None], indices[None, :]]
+        return MixedGaussianState(covariance, source_wires=kept)
+
     @pytest.fixture
     def reduced_case(self):
         """A 5-wire pure state reduced to the contiguous block ``[1, 2, 3]`` with its dense reference."""
@@ -115,7 +137,7 @@ class TestMixedGaussianState:
         operations = self.brick_wall(range(n_wires), 2, rng)
         device = NonInteractingFermionicDevice(wires=n_wires)
         device.apply([qml.BasisState(basis_state, wires=range(n_wires))] + operations)
-        state = device.partial_trace([0, 4])
+        state = self.reduced_from_device(device, [0, 4])
         psi = self.dense_state(basis_state, operations, n_wires)
         reduced_density = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [0, 4]))
         follow_up = self.brick_wall(range(3), 1, rng)
@@ -549,6 +571,53 @@ class TestMixedGaussianState:
         with pytest.raises(ValueError, match="At least one wire"):
             state.reduced_state([])
 
+    def test_init_rejects_shots_in_device_kwargs(self):
+        with pytest.raises(ValueError, match="shots"):
+            MixedGaussianState(np.zeros((4, 4)), device_kwargs={"shots": 5})
+
+    def test_execute_rejects_shots_in_device_kwargs(self, reduced_case):
+        state, _, follow_up, _ = reduced_case
+        with pytest.raises(ValueError, match="shots"):
+            state.execute(follow_up, output_type="probs", device_kwargs={"shots": 5})
+
+    def test_atol_is_read_only(self):
+        state = MixedGaussianState.from_polarizations([0.5, 0.2], atol=1e-6)
+        assert state.atol == 1e-6
+        with pytest.raises(AttributeError):
+            state.atol = 1e-3  # type: ignore[misc]
+
+    def test_single_wire_state_has_readouts_but_no_device(self):
+        state = MixedGaussianState.from_polarizations([0.5])
+        np.testing.assert_allclose(state.probs(), [0.75, 0.25], atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(state.expval(qml.PauliZ(0)), 0.5, atol=ATOL_SCALAR_COMPARISON)
+        np.testing.assert_allclose(state.purity, (1 + 0.25) / 2, atol=ATOL_SCALAR_COMPARISON)
+        for call in (lambda: state.sample(3), lambda: state.execute([], output_type="probs"), lambda: state.evolve([])):
+            with pytest.raises(ValueError, match="at least two wires"):
+                call()
+
+    def test_sample_on_shifted_wires(self):
+        state = MixedGaussianState.from_polarizations([1.0, -1.0], wires=[3, 4])
+        np.random.seed(TEST_SEED)
+        samples = state.sample(5)
+        np.testing.assert_array_equal(samples, [[0, 1]] * 5)
+        probabilities = state.execute([], output_type="probs", mode="direct", shots=5)
+        np.testing.assert_allclose(probabilities, [0.0, 1.0, 0.0, 0.0], atol=ATOL_MATRIX_COMPARISON)
+
+    def test_evolve_and_direct_execute_carry_device_kwargs(self, reduced_case):
+        state, _, follow_up, _ = reduced_case
+        evolved = state.evolve(follow_up, pfaffian_chunk_size=4)
+        assert evolved.device_kwargs == {"pfaffian_chunk_size": 4}
+        np.random.seed(TEST_SEED)
+        samples = state.execute(
+            follow_up,
+            output_type="samples",
+            mode="direct",
+            shots=3,
+            device_kwargs={"sampling_strategy": "QubitByQubitSampling", "pfaffian_chunk_size": 4},
+        )
+        assert samples.shape == (3, 3)
+        assert state.sample(2, sampling_strategy="QubitByQubitSampling").shape == (2, 3)
+
     def test_execute_parallel_batched_state(self):
         rng = np.random.default_rng(TEST_SEED)
         n_wires = 4
@@ -556,7 +625,7 @@ class TestMixedGaussianState:
         shared = self.brick_wall(range(n_wires), 1, rng)
         device = NonInteractingFermionicDevice(wires=n_wires)
         device.apply([CompRxRx(batched_angles, wires=[0, 1])] + shared)
-        state = device.partial_trace([3])
+        state = self.reduced_from_device(device, [3])
         assert state.batch_shape == (3,)
         follow_up = self.brick_wall(range(3), 1, rng)
         observable = qml.PauliX(0) @ qml.PauliX(1) + qml.PauliZ(2)
@@ -616,7 +685,7 @@ class TestMixedGaussianState:
         observable = qml.PauliX(0) @ qml.PauliX(1) + 0.4 * qml.PauliZ(1)
         device = NonInteractingFermionicDevice(wires=n_wires)
         device.apply([qml.BasisState(basis_state, wires=range(n_wires))] + build(angles))
-        value = device.partial_trace([0, 3]).execute(follow_up, observable, "expval", mode=mode)
+        value = self.reduced_from_device(device, [0, 3]).execute(follow_up, observable, "expval", mode=mode)
         (gradient,) = torch.autograd.grad(value, angles)
 
         qubit_device = qml.device("default.qubit", wires=n_wires)

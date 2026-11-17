@@ -4,10 +4,21 @@ import numpy as np
 import torch
 
 from ..typing import TensorLike
-from .math import convert_and_cast_like
+from .math import convert_like_and_cast_to
 from .torch_utils import infer_real_dtype
 
 DEGENERACY_ATOL = 1e-8
+
+
+def _real_dtype_name(tensor: torch.Tensor) -> str:
+    """Return the name (``"float32"``, ``"float64"``) of the real dtype of a tensor, for ``qml.math.cast``.
+
+    :param tensor: A real tensor.
+    :type tensor: torch.Tensor
+    :return: The dtype name.
+    :rtype: str
+    """
+    return str(tensor.dtype).removeprefix("torch.")
 
 
 class _BlockDiagonalizeCovariance(torch.autograd.Function):
@@ -122,7 +133,8 @@ def block_diagonal_covariance(polarizations: TensorLike) -> TensorLike:
 
     :param polarizations: Polarizations :math:`\lambda_j = \langle Z_j \rangle` of shape ``(..., m)``.
     :type polarizations: TensorLike
-    :return: Real antisymmetric matrix of shape ``(..., 2m, 2m)``, in the backend and dtype of the input.
+    :return: Real antisymmetric matrix of shape ``(..., 2m, 2m)``, in the backend of the input and in the real
+        floating dtype of its precision (``float64`` for an integer input).
     :rtype: TensorLike
     """
     polarizations_t = torch.as_tensor(
@@ -131,11 +143,13 @@ def block_diagonal_covariance(polarizations: TensorLike) -> TensorLike:
     polarizations_t = polarizations_t.to(infer_real_dtype(polarizations_t))
     n_modes = polarizations_t.shape[-1]
     batch_shape = polarizations_t.shape[:-1]
-    covariance = torch.zeros(*batch_shape, 2 * n_modes, 2 * n_modes, dtype=polarizations_t.dtype)
-    mode_index = torch.arange(n_modes)
+    covariance = torch.zeros(
+        *batch_shape, 2 * n_modes, 2 * n_modes, dtype=polarizations_t.dtype, device=polarizations_t.device
+    )
+    mode_index = torch.arange(n_modes, device=polarizations_t.device)
     covariance[..., 2 * mode_index, 2 * mode_index + 1] = -polarizations_t
     covariance[..., 2 * mode_index + 1, 2 * mode_index] = polarizations_t
-    return convert_and_cast_like(covariance, polarizations)
+    return convert_like_and_cast_to(covariance, polarizations, dtype=_real_dtype_name(polarizations_t))
 
 
 def block_diagonalize_covariance(covariance_matrix: TensorLike) -> Tuple[TensorLike, TensorLike]:
@@ -165,7 +179,8 @@ def block_diagonalize_covariance(covariance_matrix: TensorLike) -> Tuple[TensorL
     :param covariance_matrix: Real antisymmetric matrix of shape ``(..., 2m, 2m)``.
     :type covariance_matrix: TensorLike
     :return: The transition matrix ``R`` of shape ``(..., 2m, 2m)`` and the polarizations of shape
-        ``(..., m)``, both in the backend and dtype of the input.
+        ``(..., m)``, both in the backend of the input and in the real floating dtype of its precision
+        (``float64`` for an integer input, the real counterpart for a complex input).
     :rtype: Tuple[TensorLike, TensorLike]
     """
     is_tensor = isinstance(covariance_matrix, torch.Tensor)
@@ -174,4 +189,8 @@ def block_diagonalize_covariance(covariance_matrix: TensorLike) -> Tuple[TensorL
         covariance_t = torch.real(covariance_t)
     covariance_t = covariance_t.to(infer_real_dtype(covariance_t))
     sptm, polarizations = _BlockDiagonalizeCovariance.apply(covariance_t)
-    return convert_and_cast_like(sptm, covariance_matrix), convert_and_cast_like(polarizations, covariance_matrix)
+    dtype = _real_dtype_name(covariance_t)
+    return (
+        convert_like_and_cast_to(sptm, covariance_matrix, dtype=dtype),
+        convert_like_and_cast_to(polarizations, covariance_matrix, dtype=dtype),
+    )
