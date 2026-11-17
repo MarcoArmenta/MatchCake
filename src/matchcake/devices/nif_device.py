@@ -1,7 +1,8 @@
 from collections import defaultdict
 from dataclasses import replace as _dataclass_replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
+from itertools import product
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pennylane as qml
@@ -13,6 +14,7 @@ from pennylane.devices.preprocess import decompose
 from pennylane.exceptions import DeviceError
 from pennylane.measurements import ExpectationMP, ProbabilityMP, SampleMP, Shots
 from pennylane.operation import Operation, StatePrepBase
+from pennylane.ops.op_math import Adjoint, Pow
 from pennylane.ops.qubit.observables import BasisStateProjector
 from pennylane.tape import QuantumScript
 from pennylane.transforms.core import CompilePipeline
@@ -59,7 +61,7 @@ from .probability_strategies import (
     ProbabilityFuncDispatcher,
     ProductStateProbabilityStrategy,
 )
-from .sampling_strategies import SamplingStrategy, get_sampling_strategy
+from .sampling_strategies import ProductBasisSampling, SamplingStrategy, get_sampling_strategy
 from .star_state_finding_strategies import (
     StarStateFindingStrategy,
     get_star_state_finding_strategy,
@@ -91,7 +93,8 @@ class NonInteractingFermionicDevice(qml.devices.Device):
     The initial state of the device is the Z-zero state :math:`|0\rangle_{Z}^{\otimes N}` unless a state preparation
     operation is applied at the beginning of the circuit.
 
-    :param wires: The number of wires of the device
+    :param wires: The number of wires of the device, or its wire labels. Labels must be the consecutive
+        integers ``0, 1, ..., N - 1`` (see the note on wire labels below).
     :type wires: Union[int, Wires, List[int]]
     :param shots: The number of shots used by the device. Defaults to ``None`` (analytic mode).
     :type shots: Optional[int]
@@ -121,8 +124,13 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         strategy name or instance, or ``None`` to disable contraction. Defaults to
         :attr:`DEFAULT_CONTRACTION_METHOD`.
     :type contraction_strategy: Optional[Union[str, ContractionStrategy]]
-    :keyword sampling_strategy: The strategy used to draw samples in finite-shot mode. Defaults to
-        :attr:`DEFAULT_SAMPLING_STRATEGY`.
+    :keyword sampling_strategy: The strategy used to draw samples in finite-shot mode, as a name or an
+        instance. Defaults to :attr:`DEFAULT_SAMPLING_STRATEGY`. A
+        :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling` instance is also used for the
+        samples in other bases, so that e.g. ``ProductBasisSampling(device="cuda")`` samples every basis on
+        the GPU. The default
+        :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling` needs a product state (or basis
+        state) input, and :attr:`FALLBACK_SAMPLING_STRATEGY` is used instead for other state preparations.
     :type sampling_strategy: Union[str, SamplingStrategy]
     :keyword star_state_finding_strategy: The strategy to find the star state. Defaults to
         :attr:`DEFAULT_STAR_STATE_FINDING_STRATEGY`.
@@ -136,6 +144,14 @@ class NonInteractingFermionicDevice(qml.devices.Device):
     :Note: Probabilities are routed by :attr:`prob_dispatcher`, a fixed ordered chain of strategies resolved by
         each strategy's ``can_execute``. There is no keyword to select a strategy; to pin one, replace
         :attr:`prob_dispatcher` on the constructed device.
+    :Note: With shots, observables that are not diagonal in the computational basis can be measured when
+        they are products of Pauli operators that use a single Pauli basis per wire, such as ``qml.X(0)``,
+        ``qml.X(0) @ qml.Y(1)`` or a Hamiltonian whose terms commute qubit-wise. The samples are then drawn
+        in that product basis by :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling`,
+        which requires a product state (or basis state) input. See :meth:`generate_samples`.
+    :Note: Only the wire labels ``0, 1, ..., N - 1`` are supported, in this order. Custom labels such as
+        ``[10, 20, 30]`` or ``["a", "b", "c"]`` are not supported and raise an error at execution time.
+        Wires used in circuits and measurements (e.g. ``qml.sample(wires=[2, 0])``) must refer to these labels.
     :Note: This device is in development, and its API is subject to change.
     """
 
@@ -159,7 +175,8 @@ class NonInteractingFermionicDevice(qml.devices.Device):
     }
 
     DEFAULT_CONTRACTION_METHOD = "neighbours"
-    DEFAULT_SAMPLING_STRATEGY = "2QubitBy2QubitSampling"
+    DEFAULT_SAMPLING_STRATEGY = "ProductBasisSampling"
+    FALLBACK_SAMPLING_STRATEGY = "2QubitBy2QubitSampling"
     DEFAULT_STAR_STATE_FINDING_STRATEGY = "FromSampling"
 
     casting_priorities = [
@@ -187,6 +204,64 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         states_sampled_base_ten = samples[..., None] & powers_of_two
         return (states_sampled_base_ten > 0).astype(dtype)[..., ::-1]
 
+    @staticmethod
+    def _has_sptm_interface(op: qml.operation.Operator) -> bool:
+        """Return True when an operator is an SPTM or knows how to produce one.
+
+        :param op: The operator to check.
+        :type op: qml.operation.Operator
+        :return: True if ``op`` is a :class:`MatchgateOperation`, a
+            :class:`SingleParticleTransitionMatrixOperation`, or exposes a ``to_sptm_operation``
+            method or a ``single_particle_transition_matrix`` attribute.
+        :rtype: bool
+        """
+        if isinstance(op, (MatchgateOperation, SingleParticleTransitionMatrixOperation)):
+            return True
+        return hasattr(op, "to_sptm_operation") or hasattr(op, "single_particle_transition_matrix")
+
+    @staticmethod
+    def _can_process_samples_directly(observable: qml.operation.Operator) -> bool:
+        """Return True when computational basis samples can be processed with the observable itself.
+
+        PennyLane maps samples to the eigenvalues of the observable assuming its diagonalizing
+        gates were applied, which this device never does. This is only correct when the
+        observable is diagonal and its eigenvalues are given in computational basis order:
+        Pauli words made only of ``Z`` and identity factors, or observables that need no
+        diagonalizing gates.
+
+        :param observable: The observable to check.
+        :type observable: qml.operation.Operator
+        :return: True if the samples can be processed with the observable itself.
+        :rtype: bool
+        """
+        pauli_rep = observable.pauli_rep
+        if pauli_rep is not None:
+            return all(set(pauli_word.values()) <= {"Z"} for pauli_word in pauli_rep)
+        if not observable.has_diagonalizing_gates:
+            return False
+        return len(observable.diagonalizing_gates()) == 0
+
+    @staticmethod
+    def _diagonal_matrix_eigvals(observable: qml.operation.Operator) -> Optional[np.ndarray]:
+        """Return the eigenvalues of an observable with a diagonal matrix, in computational basis order.
+
+        This covers diagonal observables such as a diagonal ``qml.Hermitian``, whose
+        ``eigvals`` are sorted and therefore not aligned with the computational basis states.
+
+        :param observable: The observable to inspect.
+        :type observable: qml.operation.Operator
+        :return: The diagonal of the matrix of the observable, shape (2^k,) for k wires, or None
+            if the observable has no matrix, is batched, or is not diagonal.
+        :rtype: Optional[np.ndarray]
+        """
+        if not observable.has_matrix or observable.batch_size is not None:
+            return None
+        matrix = qml.math.to_numpy(observable.matrix())
+        diagonal = np.diagonal(matrix)
+        if not np.allclose(matrix, np.diag(diagonal)):
+            return None
+        return np.real(diagonal)
+
     @classmethod
     def update_single_particle_transition_matrix(
         cls,
@@ -202,11 +277,11 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :return: The updated single particle transition matrix.
         """
         if isinstance(new_sptm, Operation):
-            new_sptm = new_sptm.matrix()
+            new_sptm = SingleParticleTransitionMatrixOperation.from_operation(new_sptm).sptm_matrix()
         if old_sptm is None:
             return new_sptm
         if isinstance(old_sptm, Operation):
-            old_sptm = old_sptm.matrix()
+            old_sptm = SingleParticleTransitionMatrixOperation.from_operation(old_sptm).sptm_matrix()
         old_interface = qml.math.get_interface(old_sptm)
         new_interface = qml.math.get_interface(new_sptm)
         old_priority = cls.casting_priorities.index(old_interface)
@@ -251,10 +326,17 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         self._global_sptm: Optional[SingleParticleTransitionMatrixOperation] = None
         self._batched = False
         self._samples: Optional[np.ndarray] = None
+        self._samples_bases: Dict[Any, np.ndarray] = {}
         self._current_shots: Optional[int] = None
 
         self.sampling_strategy: SamplingStrategy = get_sampling_strategy(
             kwargs.get("sampling_strategy", self.DEFAULT_SAMPLING_STRATEGY)
+        )
+        self.fallback_sampling_strategy: SamplingStrategy = get_sampling_strategy(self.FALLBACK_SAMPLING_STRATEGY)
+        self.product_basis_sampling_strategy: ProductBasisSampling = (
+            self.sampling_strategy
+            if isinstance(self.sampling_strategy, ProductBasisSampling)
+            else ProductBasisSampling()
         )
         self.prob_dispatcher: ProbabilityFuncDispatcher = ProbabilityFuncDispatcher(
             [
@@ -369,7 +451,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         self.p_bar_set_n(self.apply_metadata["n_operations"])
         self.p_bar_set_postfix_str("Computing transition matrix")
         if kwargs.get("cache_global_sptm", False):
-            self.apply_metadata["global_sptm"] = torch_utils.to_numpy(self.global_sptm.matrix())
+            self.apply_metadata["global_sptm"] = torch_utils.to_numpy(self.global_sptm.sptm_matrix())
         self.p_bar_set_postfix_str(
             f"Global Sptm matrix computed. Compression: {self.apply_metadata.get('percentage_contracted', 0):.2f}%"
         )
@@ -384,7 +466,10 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :class:`SingleParticleTransitionMatrixOperation` (or a subclass of either), or if it
         already knows how to produce a single-particle transition matrix (it exposes a
         ``to_sptm_operation`` method or a ``single_particle_transition_matrix`` attribute), it is
-        returned unchanged and handled downstream by :meth:`apply_op`. Otherwise, the operation's
+        returned unchanged and handled downstream by :meth:`apply_op`. Nested lazy
+        :class:`~pennylane.ops.op_math.Adjoint` and integer :class:`~pennylane.ops.op_math.Pow`
+        wrappers around one of these are converted directly to the corresponding SPTM, without
+        decomposing. Otherwise, the operation's
         matrix is fed to the :class:`MatchgateOperation` constructor, which validates that it is a
         matchgate. If the matrix is a matchgate, the resulting :class:`MatchgateOperation` is
         returned; if not, a :class:`DeviceError` is raised.
@@ -395,10 +480,15 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :rtype: qml.operation.Operation
         :raises DeviceError: If ``op`` is neither a supported operation nor a matchgate.
         """
-        if isinstance(op, (MatchgateOperation, SingleParticleTransitionMatrixOperation)):
+        if self._has_sptm_interface(op):
             return op
-        if hasattr(op, "to_sptm_operation") or hasattr(op, "single_particle_transition_matrix"):
-            return op
+        base = op
+        while isinstance(base, Adjoint) or (
+            isinstance(base, Pow) and SingleParticleTransitionMatrixOperation._is_integer_exponent(base.z)
+        ):
+            base = base.base
+        if base is not op and self._has_sptm_interface(base):
+            return SingleParticleTransitionMatrixOperation.from_operation(op)
         try:
             return MatchgateOperation(op.matrix(), wires=op.wires)
         except Exception as error:
@@ -423,7 +513,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :return: The updated single-particle transition matrix, represented as an
             instance of ``SingleParticleTransitionMatrixOperation``.
         """
-        op_sptm = SingleParticleTransitionMatrixOperation.from_operation(op).pad(self.wires).matrix()
+        op_sptm = SingleParticleTransitionMatrixOperation.from_operation(op).pad(self.wires).sptm_matrix()
         op_sptm = qml.math.cast(op_sptm, self._r_dtype_name)
         self._batched = self._batched or (qml.math.ndim(op_sptm) > 2)
         self.global_sptm = self.update_single_particle_transition_matrix(self._global_sptm, op_sptm)
@@ -434,6 +524,11 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         Apply a state preparation operation to the device. Will set the internal state of the device
         only if the operation is a state preparation operation and then return True. Otherwise, it will
         return False.
+
+        A product state preparation (:class:`~pennylane.BasisState` or
+        :class:`~matchcake.operations.state_preparation.ProductState`) is extended to the device wires in
+        the device wire order, so it can act on part of the wires or list them in any order. The other
+        wires start in :math:`|0\rangle`.
 
         :param operation: The operation to apply
         :type operation: qml.operation.Operation
@@ -450,7 +545,9 @@ class NonInteractingFermionicDevice(qml.devices.Device):
 
         is_applied = True
         if isinstance(operation, BasisState):
-            self._state_prep_op = ProductState.from_basis_state(operation)
+            operation = ProductState.from_basis_state(operation)
+        if isinstance(operation, ProductState) and self._wires is not None:
+            self._state_prep_op = operation.to_wires(self.wires)
         elif isinstance(operation, StatePrepBase):
             self._state_prep_op = operation
         else:
@@ -542,8 +639,9 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         cannot be computed using any of the defined strategies, an error is raised.
 
         :param observable: The observable for which the expectation value is to be
-            computed. It must be of a compatible type such as BasisStateProjector
-            or BatchProjector, or match the supported execution strategies.
+            computed. It must be of a compatible type such as BasisStateProjector,
+            BatchProjector or Hermitian (decomposed into Pauli words), or match the supported
+            execution strategies.
         :type observable: qml.operation.Operator
         :return: The computed expectation value of the given observable.
         :rtype: TensorLike
@@ -558,6 +656,8 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             return self.get_state_probability(observable.parameters[0], observable.wires)
         if isinstance(observable, BatchProjector):
             return self.get_states_probability(observable.get_states(), observable.get_batch_wires())
+        if isinstance(observable, qml.Hermitian):
+            return self._hermitian_exact_expval(observable)
         if self.m_pfaffian_expval_strategy.can_execute(self.state_prep_op, observable):
             return self.m_pfaffian_expval_strategy(
                 self.state_prep_op,
@@ -567,7 +667,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             )
         if self.clifford_expval_strategy.can_execute(self.state_prep_op, observable):  # pragma: no cover
             return self.clifford_expval_strategy(
-                self.state_prep_op, observable, global_sptm=self.global_sptm.matrix()
+                self.state_prep_op, observable, global_sptm=self.global_sptm.sptm_matrix()
             )  # pragma: no cover
         if self.expval_from_probabilities_strategy.can_execute(self.state_prep_op, observable):
             return self.expval_from_probabilities_strategy(self.state_prep_op, observable, prob_func=self.probability)
@@ -579,7 +679,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
                 self.state_prep_op,
                 observable,
                 extended_covariance_matrix=self.extended_covariance_matrix,
-                global_sptm=self.global_sptm.matrix(),
+                global_sptm=self.global_sptm.sptm_matrix(),
                 prob_func=self.probability,
                 pfaffian_chunk_size=self.pfaffian_chunk_size,
             )
@@ -731,29 +831,60 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         """
         if self._active_shots is None:
             return self.exact_expval(observable)
-        mp = ExpectationMP(obs=observable)
-        return mp.process_samples(self._samples, wire_order=self.wires, shot_range=shot_range, bin_size=bin_size)
+        mp = self._build_sampled_measurement(ExpectationMP, observable)
+        return mp.process_samples(
+            self._samples_in_pennylane_layout(), wire_order=self.wires, shot_range=shot_range, bin_size=bin_size
+        )
 
-    def generate_samples(self) -> np.ndarray:
-        r"""Returns the computational basis samples generated for all wires.
+    def generate_samples(self, bases: Optional[Mapping[Any, Union[str, Sequence[float]]]] = None) -> np.ndarray:
+        r"""Generate samples for all wires, in the computational basis or in a product basis.
 
         Note that PennyLane uses the convention :math:`|q_0,q_1,\dots,q_{N-1}\rangle` where
         :math:`q_0` is the most significant bit.
 
-        .. warning::
+        Without ``bases``, or when every basis is ``"Z"``, the samples are drawn in the computational
+        basis by :attr:`sampling_strategy`, or by :attr:`fallback_sampling_strategy` when
+        :attr:`sampling_strategy` is a :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling`
+        and the state preparation is not a product state. Otherwise, each wire listed in ``bases`` is measured in its
+        own basis and the samples are drawn by :attr:`product_basis_sampling_strategy`, which requires a
+        product state (or basis state) input. Bit ``0`` then stands for the eigenvalue :math:`+1` of the
+        measured Pauli operator, or of :math:`\hat{n} \cdot \vec{\sigma}` for a Bloch vector
+        :math:`\hat{n}`, and bit ``1`` for :math:`-1`.
 
-            This method should be overwritten on devices that
-            generate their own computational basis samples, with the resulting
-            computational basis samples stored as ``self._samples``.
-
-        Returns:
-             array[complex]: array of samples in the shape ``(dev.shots, dev.num_wires)``
+        :param bases: The measurement basis of some wires, keyed by wire label. A basis is a Pauli
+            letter (``"X"``, ``"Y"`` or ``"Z"``) or a Bloch vector of length 3. Wires not listed are
+            measured in the computational basis. Defaults to None.
+        :type bases: Optional[Mapping[Any, Union[str, Sequence[float]]]]
+        :return: Samples of shape (shots, ..., num_wires), also stored in :attr:`samples`.
+        :rtype: np.ndarray
+        :raises DeviceError: If a non computational basis is requested and the state preparation is
+            not a product state.
         """
-        self._samples = self.sampling_strategy.batch_generate_samples(
-            self,
-            partial(self.get_states_probability, show_progress=False),
-            show_progress=self.show_progress,
-        )
+        bloch_vectors = self._bases_to_bloch_vectors(bases or {})
+        rotated_bases = {
+            wire: bloch_vector
+            for wire, bloch_vector in zip(self.wires, bloch_vectors)
+            if not np.allclose(bloch_vector, ProductBasisSampling.PAULI_BLOCH_VECTORS["Z"])
+        }
+        if not rotated_bases:
+            sampling_strategy = self.sampling_strategy
+            if isinstance(sampling_strategy, ProductBasisSampling) and not isinstance(self.state_prep_op, ProductState):
+                sampling_strategy = self.fallback_sampling_strategy
+            self._samples = sampling_strategy.batch_generate_samples(
+                self,
+                partial(self.get_states_probability, show_progress=False),
+                show_progress=self.show_progress,
+            )
+        else:
+            if not isinstance(self.state_prep_op, ProductState):
+                raise DeviceError(
+                    f"Sampling in a basis other than the computational basis on {self.name} requires a product "
+                    f"state or basis state preparation. Got {self.state_prep_op} instead."
+                )
+            self._samples = self.product_basis_sampling_strategy.batch_generate_samples(
+                self, bloch_vectors=bloch_vectors, show_progress=self.show_progress
+            )
+        self._samples_bases = rotated_bases
         assert self._samples is not None
         return self._samples
 
@@ -826,7 +957,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             all_wires=self.wires,
             lookup_table=self.lookup_table,
             transition_matrix=self.transition_matrix,
-            global_sptm=self.global_sptm.matrix(),
+            global_sptm=self.global_sptm.sptm_matrix(),
             majorana_getter=self.majorana_getter,
             show_progress=kwargs.pop("show_progress", self.show_progress),
             pfaffian_chunk_size=kwargs.pop("pfaffian_chunk_size", self.pfaffian_chunk_size),
@@ -1033,7 +1164,9 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         if self._active_shots is None:
             return self.analytic_probability(wires=wires)
         mp = ProbabilityMP(wires=Wires(wires))
-        return mp.process_samples(self._samples, wire_order=self.wires, shot_range=shot_range, bin_size=bin_size)
+        return mp.process_samples(
+            self._samples_in_pennylane_layout(), wire_order=self.wires, shot_range=shot_range, bin_size=bin_size
+        )
 
     def reset(self) -> None:
         """Reset the device state to its initial configuration.
@@ -1047,6 +1180,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         self._star_state = None
         self._star_probability = None
         self._samples = None
+        self._samples_bases = {}
         self.apply_metadata = defaultdict()
         self.contraction_strategy.reset()
         if self._wires is not None:
@@ -1168,6 +1302,108 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             x = qml.math.real(x)
         return qml.math.cast(torch_utils.to_cpu(x, dtype=dtype), dtype=dtype)
 
+    def _bases_to_bloch_vectors(self, bases: Mapping[Any, Union[str, Sequence[float]]]) -> np.ndarray:
+        """Convert measurement bases keyed by wire into one Bloch vector per device wire.
+
+        :param bases: The measurement basis of some wires, as a Pauli letter or a Bloch vector.
+        :type bases: Mapping[Any, Union[str, Sequence[float]]]
+        :return: The Bloch vectors in device wire order, shape (num_wires, 3). Wires not listed
+            in ``bases`` get the computational basis.
+        :rtype: np.ndarray
+        :raises ValueError: If a wire is not on the device or a basis is not a Pauli letter or a
+            non-zero Bloch vector of length 3.
+        """
+        assert self.num_wires is not None
+        bloch_vectors = ProductBasisSampling.pauli_bloch_vectors(["Z"] * self.num_wires)
+        for wire, basis in bases.items():
+            if wire not in self.wires:
+                raise ValueError(f"The wire {wire} is not on the device, whose wires are {self.wires.tolist()}.")
+            if isinstance(basis, str):
+                bloch_vector = ProductBasisSampling.pauli_bloch_vectors([basis.upper()])[0]
+            else:
+                bloch_vector = np.asarray(qml.math.unwrap(basis), dtype=float)
+                norm = np.linalg.norm(bloch_vector) if bloch_vector.shape == (3,) else 0.0
+                if norm < 1e-12:
+                    raise ValueError(f"The basis of wire {wire} must be a non-zero Bloch vector of length 3.")
+                bloch_vector = bloch_vector / norm
+            bloch_vectors[self.wires.index(wire)] = bloch_vector
+        return bloch_vectors
+
+    def _build_sampled_measurement(
+        self,
+        measurement_type: type[Union[ExpectationMP, SampleMP]],
+        observable: Optional[qml.operation.Operator],
+    ) -> Union[ExpectationMP, SampleMP]:
+        """Build a measurement process that correctly processes the current samples.
+
+        The device does not rotate the samples into the eigenbasis of the observable. When the
+        samples were drawn in a product basis (see :meth:`generate_samples`), Pauli observables
+        that match that basis are first rewritten with ``Z`` on the rotated wires, by
+        :meth:`_observable_in_sampled_frame`. The observable must then be diagonal in the
+        computational basis. Diagonal observables whose eigenvalues are not in computational
+        basis order (e.g. a diagonal ``qml.Hermitian``) are measured through the diagonal of
+        their matrix.
+
+        :param measurement_type: The measurement process class to build.
+        :type measurement_type: type[Union[ExpectationMP, SampleMP]]
+        :param observable: The observable to estimate from samples, or None when there is none.
+        :type observable: Optional[qml.operation.Operator]
+        :return: The measurement process to call ``process_samples`` on.
+        :rtype: Union[ExpectationMP, SampleMP]
+        :raises DeviceError: If the observable is not diagonal in the basis of the samples.
+        """
+        if observable is not None:
+            observable = self._observable_in_sampled_frame(observable)
+        if observable is None or self._can_process_samples_directly(observable):
+            return measurement_type(obs=observable)
+        eigvals = self._diagonal_matrix_eigvals(observable)
+        if eigvals is not None:
+            return measurement_type(eigvals=eigvals, wires=observable.wires)
+        raise DeviceError(
+            f"The observable {observable} is not diagonal in the computational basis and cannot be "
+            f"estimated from shots on {self.name}. Use analytic mode (shots=None) or an observable "
+            f"diagonal in the computational basis."
+        )
+
+    def _hermitian_exact_expval(self, observable: qml.Hermitian) -> TensorLike:
+        """Compute the exact expectation value of a Hermitian observable.
+
+        A Hermitian matrix ``H`` on k wires decomposes as ``H = sum_P tr(P H) / 2^k P`` over the
+        4^k Pauli words ``P``, which the Pauli word strategies evaluate exactly. When the matrix
+        is not trainable, the words with a non-zero coefficient are evaluated together as a
+        single Pauli sum. The strategies do not propagate gradients through the coefficients of
+        a sum, so when the matrix is trainable each word is evaluated separately and weighted
+        here instead.
+
+        :param observable: The Hermitian observable.
+        :type observable: qml.Hermitian
+        :return: The expectation value of the observable, shape (...) for batched circuits.
+        :rtype: TensorLike
+        """
+        matrix = observable.matrix()
+        wires = observable.wires
+        dimension = 2 ** len(wires)
+        is_trainable = qml.math.requires_grad(matrix)
+        coeffs, pauli_words = [], []
+        for letters in product("IXYZ", repeat=len(wires)):
+            pauli_word = qml.pauli.PauliWord({wire: letter for wire, letter in zip(wires, letters) if letter != "I"})
+            word_matrix = qml.math.convert_like(pauli_word.to_mat(wire_order=wires), matrix)
+            coeff = qml.math.real(qml.math.trace(qml.math.dot(word_matrix, matrix))) / dimension
+            # The identity word is always kept so that the decomposition is never empty.
+            is_identity = len(pauli_word) == 0
+            if not is_identity and not is_trainable and qml.math.allclose(coeff, 0.0):
+                continue
+            coeffs.append(coeff)
+            pauli_words.append(pauli_word.operation(wire_order=wires))
+        if not is_trainable:
+            return qml.math.real(self.exact_expval(qml.Hamiltonian(coeffs, pauli_words)))
+        weighted_terms = []
+        for coeff, pauli_word in zip(coeffs, pauli_words):
+            word_expval = qml.math.real(self.exact_expval(pauli_word))  # (...)
+            weighted_terms.append(utils.math.convert_and_cast_like(coeff, word_expval) * word_expval)
+        # The sum broadcasts the unbatched identity term over the batch dimensions.
+        return sum(weighted_terms[1:], weighted_terms[0])
+
     def _dot(self, a: TensorLike, b: TensorLike) -> TensorLike:
         r"""
         Compute the dot product of two arrays.
@@ -1197,9 +1433,78 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         self.reset()
         self.apply_generator(iter(circuit.operations))
         if self._current_shots is not None:
-            self._samples = self.generate_samples()
+            self._samples = self.generate_samples(self._measurement_bases(circuit.measurements))
         results = [self._process_measurement(m) for m in circuit.measurements]
         return results[0] if len(results) == 1 else tuple(results)
+
+    def _measurement_bases(self, measurements: Sequence[qml.measurements.MeasurementProcess]) -> Dict[Any, str]:
+        """Find the Pauli basis in which each wire must be sampled for a set of measurements.
+
+        Pauli observables give the Pauli letter of each of their wires. Measurements without an
+        observable, and observables without a Pauli representation (such as a diagonal
+        ``qml.Hermitian``), need the computational basis on their wires.
+
+        :param measurements: The measurements of a circuit.
+        :type measurements: Sequence[qml.measurements.MeasurementProcess]
+        :return: The Pauli letter of the wires not sampled in the computational basis.
+        :rtype: Dict[Any, str]
+        :raises DeviceError: If a wire needs two different bases, i.e. the measurements do not
+            commute qubit-wise.
+        """
+        letters_by_wire: Dict[Any, set] = defaultdict(set)
+        for measurement in measurements:
+            observable = measurement.obs
+            pauli_rep = None if observable is None else observable.pauli_rep
+            if pauli_rep is None:
+                wires = measurement.wires if observable is None else observable.wires
+                for wire in wires or self.wires:
+                    letters_by_wire[wire].add("Z")
+                continue
+            for pauli_word in pauli_rep:
+                for wire, letter in pauli_word.items():
+                    letters_by_wire[wire].add(letter)
+        conflicts = {wire: sorted(letters) for wire, letters in letters_by_wire.items() if len(letters) > 1}
+        if conflicts:
+            raise DeviceError(
+                f"The measurements need several bases on the same wires ({conflicts}) and cannot be estimated "
+                f"from the same shots on {self.name}. Measure observables that commute qubit-wise."
+            )
+        return {wire: letters.pop() for wire, letters in letters_by_wire.items() if letters != {"Z"}}
+
+    def _observable_in_sampled_frame(self, observable: qml.operation.Operator) -> qml.operation.Operator:
+        """Rewrite an observable for samples drawn in a product basis.
+
+        On the wires sampled in a rotated basis, the samples are the bits of the measured
+        Pauli operator. A Pauli observable that uses that Pauli on those wires is therefore
+        processed as the same observable with ``Z`` on them.
+
+        :param observable: The observable to rewrite.
+        :type observable: qml.operation.Operator
+        :return: The observable to process the samples with. It is unchanged when it does not
+            act on a rotated wire.
+        :rtype: qml.operation.Operator
+        :raises DeviceError: If the observable acts on a rotated wire with another operator than
+            the Pauli measured there.
+        """
+        if not any(wire in self._samples_bases for wire in observable.wires):
+            return observable
+        pauli_rep = observable.pauli_rep
+        error = DeviceError(
+            f"The observable {observable} does not match the bases in which the samples were drawn on {self.name}."
+        )
+        if pauli_rep is None:
+            raise error
+        sentence = qml.pauli.PauliSentence()
+        for pauli_word, coeff in pauli_rep.items():
+            diagonal_word = {}
+            for wire, letter in pauli_word.items():
+                letter_bloch_vector = ProductBasisSampling.PAULI_BLOCH_VECTORS[letter]
+                sampled_bloch_vector = self._samples_bases.get(wire, ProductBasisSampling.PAULI_BLOCH_VECTORS["Z"])
+                if not np.allclose(letter_bloch_vector, sampled_bloch_vector):
+                    raise error
+                diagonal_word[wire] = "Z"
+            sentence[qml.pauli.PauliWord(diagonal_word)] = coeff
+        return sentence.operation(wire_order=observable.wires)
 
     def _process_measurement(self, measurement: qml.measurements.MeasurementProcess) -> Any:
         """Dispatch a single measurement to the appropriate handler.
@@ -1215,10 +1520,30 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         if isinstance(measurement, ProbabilityMP):
             return self.probability(wires=measurement.wires or self.wires)
         if isinstance(measurement, SampleMP):
+            samples = self._samples_in_pennylane_layout()  # (..., shots, num_wires)
             if measurement.obs is None:
-                return self._samples
-            return measurement.process_samples(self._samples, wire_order=self.wires)
+                if not measurement.wires:
+                    return samples
+                # samples: (..., shots, num_wires) -> (..., shots, len(measurement.wires))
+                return samples[..., self.wires.indices(measurement.wires)]
+            mp = self._build_sampled_measurement(SampleMP, measurement.obs)
+            return mp.process_samples(samples, wire_order=self.wires)
         raise NotImplementedError(f"Measurement {type(measurement).__name__} is not supported by {self.name}.")
+
+    def _samples_in_pennylane_layout(self) -> np.ndarray:
+        """Return the current samples with the axes in the order PennyLane expects.
+
+        The sampling strategies return samples of shape (shots, ..., num_wires), with the batch
+        axes of a batched circuit after the shots. PennyLane processes samples of shape
+        (..., shots, num_wires), with the batch axes first.
+
+        :return: The samples, shape (..., shots, num_wires).
+        :rtype: np.ndarray
+        :raises ValueError: If no samples have been generated.
+        """
+        if self._samples is None:
+            raise ValueError("No samples have been generated. The number of shots must be specified.")
+        return np.moveaxis(np.asarray(self._samples), 0, -2)
 
     def _stopping_condition(self, op: qml.operation.Operator) -> bool:
         """Return True when an operator is natively supported by this device.
@@ -1254,7 +1579,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
                 f"Got {type(self.state_prep_op)} instead of ProductState."
             )
         cov0 = self.state_prep_op.covariance_matrix
-        sptm = self.global_sptm.matrix(self.wires)
+        sptm = self.global_sptm.sptm_matrix(self.wires)
         return qml.math.einsum("...ij,...ik,...kl->...jl", sptm, cov0, sptm)
 
     @property
@@ -1284,7 +1609,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         ext_cov0 = _extended_covariance_matrix(cov0, d0)  # (2n+1, 2n+1)
 
         # Lift SPTM: \tilde{R} = R ⊕ 1
-        sptm = self.global_sptm.matrix(self.wires)  # (2n, 2n)
+        sptm = self.global_sptm.sptm_matrix(self.wires)  # (2n, 2n)
         lifted_sptm = _sptm_lift(sptm)  # (2n+1, 2n+1)
 
         # Evolve: tilde_Lambda(t) = tilde_Q^T tilde_Lambda_0 tilde_Q
@@ -1311,7 +1636,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             value = SingleParticleTransitionMatrixOperation.from_operation(value)
         if not isinstance(value, SingleParticleTransitionMatrixOperation):
             value = SingleParticleTransitionMatrixOperation(value, wires=self.wires)
-        matrix = qml.math.cast(value.matrix(), self._r_dtype_name)
+        matrix = qml.math.cast(value.sptm_matrix(), self._r_dtype_name)
         self._global_sptm = SingleParticleTransitionMatrixOperation(matrix, wires=value.wires, **value._hyperparameters)
         self.transition_matrix = None
 
@@ -1339,7 +1664,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
 
     @property
     def samples(self) -> Optional[TensorLike]:
-        """The computational basis samples from the last execution.
+        """The samples from the last execution, in the bases given to :meth:`generate_samples`.
 
         :return: Sample array of shape (shots, num_wires), or None.
         :rtype: Optional[TensorLike]
@@ -1408,13 +1733,13 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :rtype: Optional[TensorLike]
         """
         if self._transition_matrix is None and self.global_sptm is not None:
-            self._transition_matrix = utils.make_transition_matrix_from_action_matrix(self.global_sptm.matrix())
+            self._transition_matrix = utils.make_transition_matrix_from_action_matrix(self.global_sptm.sptm_matrix())
         return self._transition_matrix
 
     @transition_matrix.setter
     def transition_matrix(self, value: Optional[TensorLike]) -> None:
         if self._global_sptm is not None and value is not None:
-            global_sptm_matrix = self._global_sptm.matrix()
+            global_sptm_matrix = self._global_sptm.sptm_matrix()
             value = convert_like_and_cast_to(
                 value, global_sptm_matrix, dtype=complex_dtype_name_like(global_sptm_matrix)
             )
