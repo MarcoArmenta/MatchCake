@@ -14,7 +14,7 @@ from ..devices.expval_strategies.m_pfaffian import MPfaffianExpvalStrategy
 from ..devices.expval_strategies.m_pfaffian._extended_covariance import extended_covariance_matrix
 from ..devices.nif_device import NonInteractingFermionicDevice
 from ..devices.probability_strategies import ProductStateProbabilityStrategy
-from ..devices.sampling_strategies import get_sampling_strategy
+from ..devices.sampling_strategies import ProductBasisSampling, get_sampling_strategy
 from ..observables.batch_hamiltonian import BatchHamiltonian
 from ..operations.single_particle_transition_matrices.single_particle_transition_matrix import (
     SingleParticleTransitionMatrixOperation,
@@ -304,7 +304,7 @@ class MixedGaussianState:
         operations = self._check_operations(operations)
         device = self._make_device(**device_kwargs)
         device.apply(operations)
-        circuit_sptm = device.global_sptm.matrix(self.wires)
+        circuit_sptm = device.global_sptm.sptm_matrix(self.wires)
         covariance = self.covariance_matrix
         if isinstance(circuit_sptm, torch.Tensor):
             covariance = convert_and_cast_like(covariance, circuit_sptm)
@@ -550,7 +550,10 @@ class MixedGaussianState:
         Draw computational-basis samples from the state.
 
         The samples are generated wire block by wire block with the chain rule of probability, using the
-        sampling strategies of the device with the probabilities of :meth:`probs`.
+        sampling strategies of the device with the probabilities of :meth:`probs`. A
+        :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling` strategy, the default of the
+        device, reads the state of a device instead of these probabilities, so the fallback strategy of the
+        device is used in its place.
 
         :param shots: Number of samples.
         :type shots: Optional[int]
@@ -565,6 +568,8 @@ class MixedGaussianState:
             raise ValueError("The number of shots must be specified to generate samples.")
         device = self._make_device(shots=shots, **device_kwargs)
         strategy = device.sampling_strategy if sampling_strategy is None else get_sampling_strategy(sampling_strategy)
+        if isinstance(strategy, ProductBasisSampling):
+            strategy = device.fallback_sampling_strategy
         return np.asarray(
             strategy.batch_generate_samples(device, self._states_probability_at_positions, show_progress=False)
         ).astype(int)

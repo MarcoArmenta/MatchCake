@@ -181,7 +181,7 @@ class TestNonInteractingFermionicDevicePartialTrace:
         follow_up = self.brick_wall(range(3), 1, rng)
         reduced_device = NonInteractingFermionicDevice(wires=3)
         reduced_device.apply(follow_up)
-        reduced_sptm = np.asarray(reduced_device.global_sptm.matrix())
+        reduced_sptm = np.asarray(reduced_device.global_sptm.sptm_matrix())
         embedded_sptm = np.eye(2 * device.num_wires)
         majorana_map = MixedGaussianState.majorana_indices(kept_wires)
         embedded_sptm[np.ix_(majorana_map, majorana_map)] = reduced_sptm

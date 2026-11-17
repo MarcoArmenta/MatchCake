@@ -283,7 +283,7 @@ class TestMixedGaussianState:
         assert isinstance(operation, SingleParticleTransitionMatrixOperation)
         assert operation.wires.tolist() == [0, 1]
         np.testing.assert_allclose(
-            operation.matrix(), state.sptm, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+            operation.sptm_matrix(), state.sptm, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
         )
         prep, sptm_op = state.pure_state_operations(1)
         assert isinstance(prep, ProductState)
@@ -314,7 +314,7 @@ class TestMixedGaussianState:
         prep, sptm_op = state.ensemble_operations()
         assert prep.batch_size == 2 * num_members
         assert sptm_op.batch_size == 2 * num_members
-        sptm = np.asarray(sptm_op.matrix())
+        sptm = np.asarray(sptm_op.sptm_matrix())
         for batch_index in range(2):
             for member in range(num_members):
                 np.testing.assert_allclose(
@@ -327,7 +327,7 @@ class TestMixedGaussianState:
         reconstructed = np.zeros((2**n_wires, 2**n_wires), dtype=complex)
         for weight, prep, sptm_op in state.pure_states():
             unitary = np.asarray(
-                SingleParticleTransitionMatrixOperation.to_unitary_matrix(torch.as_tensor(sptm_op.matrix()))
+                SingleParticleTransitionMatrixOperation.to_unitary_matrix(torch.as_tensor(sptm_op.sptm_matrix()))
             )
             vector = unitary @ prep.state_vector().reshape(-1)
             reconstructed += float(weight) * np.outer(vector, vector.conj())
