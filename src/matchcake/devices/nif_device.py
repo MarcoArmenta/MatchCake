@@ -974,24 +974,19 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         missing = [wire for wire in kept.tolist() if wire not in self.wires]
         if missing:
             raise ValueError(f"Wires {missing} are not wires of the device ({self.wires.tolist()}).")
-        if len(kept) == 0:
-            raise ValueError("At least one wire must be kept.")
-        positions = sorted(self.wires.indices(kept))
-        indices = MixedGaussianState.majorana_indices(positions)
-        covariance_matrix: Any = self.covariance_matrix
-        covariance = covariance_matrix[..., indices[:, None], indices[None, :]]
         state_kwargs = {} if atol is None else {"atol": atol}
-        return MixedGaussianState(
-            covariance,
-            wires=reduced_wires,
+        full_state = MixedGaussianState(
+            self.covariance_matrix,
+            wires=range(len(self.wires)),
             device_kwargs={
                 "r_dtype": self.R_DTYPE,
                 "c_dtype": self.C_DTYPE,
                 "pfaffian_chunk_size": self.pfaffian_chunk_size,
             },
-            source_wires=[self.wires.tolist()[position] for position in positions],
+            source_wires=self.wires.tolist(),
             **state_kwargs,
         )
+        return full_state.reduced_state(self.wires.indices(kept), reduced_wires=reduced_wires)
 
     def preprocess_transforms(self, execution_config: Optional[ExecutionConfig] = None) -> CompilePipeline:
         """Return the compile pipeline for preprocessing circuits before execution.
