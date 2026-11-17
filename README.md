@@ -187,11 +187,21 @@ expval = nif_qnode(np.random.random(2), wires=nif_device.wires, initial_state=in
 print(f"Expectation value: {expval}")
 ```
 
-## Tracing Out Wires and Continuing on the Reduced State
+## Mixed States and Partial Trace
 
-After a circuit, the device can trace out wires. The reduced state is generally mixed, but it stays a
-fermionic Gaussian state, so it decomposes into a few pure states the device can prepare. A follow-up circuit
-is then run on every member, one at a time or all at once, and the results are recombined.
+**Note:** this feature is on the `dev` branch of this fork while it is reviewed upstream (pull requests
+[#203](https://github.com/MatchCake/MatchCake/pull/203) and [#204](https://github.com/MatchCake/MatchCake/pull/204)).
+Install it with `pip install "git+https://github.com/MarcoArmenta/MatchCake@dev"`.
+
+A matchgate circuit keeps the state of the device fermionic Gaussian, so tracing out wires gives a state that is
+generally mixed but still Gaussian. `matchcake.states.MixedGaussianState` stores such a state as the covariance
+matrix of its wires (2m x 2m for m wires). Entropies, expectation values, probabilities and samples are computed
+from that matrix, without building the density matrix.
+
+### Tracing out wires of a circuit
+
+After a circuit has been applied to the device, `partial_trace` takes the wires to remove and `reduced_state`
+the wires to keep. Both return a `MixedGaussianState` on the remaining wires, relabeled from 0.
 
 ```python
 import matchcake as mc
@@ -208,20 +218,111 @@ nif_device.apply([
     mc.operations.CompRzRz(np.array([0.8, 0.1]), wires=[1, 2]),
 ])
 
-# Trace out wires 4 and 5: a mixed state on the remaining wires, relabeled 0..3
+# Trace out wires 4 and 5. The remaining wires are relabeled 0..3.
 mixed_state = nif_device.partial_trace([4, 5])
-print(mixed_state.entropy(), mixed_state.num_pure_states)  # entanglement entropy of the cut, number of pure states
+# The same state, naming the wires to keep instead
+mixed_state = nif_device.reduced_state([0, 1, 2, 3])
 
-# Run a follow-up circuit on the reduced system and measure, recombining over the pure states
-follow_up = [mc.operations.CompRxRx(np.array([0.1, 0.2]), wires=[1, 2])]
-observable = qml.PauliZ(0) @ qml.PauliZ(1) + 0.5 * qml.PauliX(2) @ qml.PauliX(3)
-expval = mixed_state.execute(follow_up, observable, "expval", mode="parallel")  # or "sequential", "direct"
-probs = mixed_state.execute(follow_up, output_type="probs")
+print(mixed_state.entropy())         # 0.2797, entanglement entropy between wires 0-3 and wires 4-5
+print(mixed_state.purity)            # 0.8522, Tr(rho^2), which is 1 for a pure state
+print(mixed_state.num_pure_states)   # 2
+print(mixed_state.weights)           # [0.0804, 0.9196]
+print(mixed_state.density_matrix())  # dense 16 x 16 matrix, for small systems only
 ```
 
-The kept wires are reduced with the fermionic partial trace, which coincides with the qubit partial trace when
-they form a contiguous block. See the [theory page](https://github.com/MatchCake/MatchCake/blob/dev/docs/partial_trace_theory.md)
-for the details.
+The reduced state is a mixture of a few pure Gaussian states that the device can prepare, at most 2^k of them
+for k traced-out wires. Their probabilities are in `weights`, and `pure_states()` iterates over them.
+
+### Running a circuit on a mixed state
+
+`execute` runs a follow-up circuit on the state and returns an expectation value, probabilities or samples.
+Continuing the example above:
+
+```python
+follow_up = [mc.operations.CompRxRx(np.array([0.1, 0.2]), wires=[1, 2])]
+observable = qml.PauliZ(0) @ qml.PauliZ(1) + 0.5 * qml.PauliX(2) @ qml.PauliX(3)
+
+expval = mixed_state.execute(follow_up, observable, "expval", mode="direct")  # -1.3900
+probs = mixed_state.execute(follow_up, output_type="probs", mode="direct")  # 16 probabilities
+samples = mixed_state.execute(follow_up, output_type="samples", mode="direct", shots=1024)  # shape (1024, 4)
+```
+
+The `mode` argument selects how the circuit is run. The three modes return the same analytic values.
+
+- `"direct"` applies the circuit to the covariance matrix. It is a single execution, whatever the number of
+  pure states.
+- `"parallel"` (the default) runs the circuit on every pure state of the mixture in one batched execution of
+  the device, then recombines the outputs with the weights.
+- `"sequential"` does the same, one pure state at a time.
+
+### Building a mixed state directly
+
+A mixed state does not have to come from a circuit. `from_polarizations` builds a product of single-wire
+mixtures, and the constructor takes a covariance matrix directly.
+
+```python
+import matchcake as mc
+import pennylane as qml
+import numpy as np
+from matchcake.states import MixedGaussianState
+
+# One polarization per wire: +1 is |0>, -1 is |1>, 0 is maximally mixed
+state = MixedGaussianState.from_polarizations(np.array([1.0, 0.0, -1.0, 0.5]))
+print(state.entropy(), state.purity)  # 1.2555, 0.3125
+
+# Evolve the state with a matchgate circuit, then read it out
+evolved = state.evolve([
+    mc.operations.CompRxRx(np.array([0.3, 0.7]), wires=[0, 1]),
+    mc.operations.CompRyRy(np.array([0.2, 1.1]), wires=[2, 3]),
+    mc.operations.fSWAP(wires=[1, 2]),
+])
+print(evolved.expval(qml.PauliZ(0)))  # 0.8601
+print(evolved.probs(wires=[0, 1]))    # [0.1929, 0.7372, 0.0145, 0.0554]
+print(evolved.sample(shots=5))        # 5 samples of the 4 wires
+
+# A mixed state can be traced again
+print(evolved.partial_trace([3]).entropy())  # 1.2036
+
+# The same state, from its covariance matrix
+same_state = MixedGaussianState(evolved.covariance_matrix)
+```
+
+### Gradients
+
+With PyTorch parameters, the reduced state and everything computed from it are differentiable.
+
+```python
+import matchcake as mc
+import pennylane as qml
+import numpy as np
+import torch
+
+params = torch.tensor([0.3, 0.7], dtype=torch.float64, requires_grad=True)
+nif_device = mc.NonInteractingFermionicDevice(wires=4)
+nif_device.apply([
+    qml.BasisState(np.array([1, 0, 1, 0]), wires=range(4)),
+    mc.operations.CompRxRx(params, wires=[0, 1]),
+    mc.operations.CompRyRy(params, wires=[1, 2]),
+    mc.operations.CompRxRx(params, wires=[2, 3]),
+])
+
+# Entanglement entropy between wires 0-1 and wires 2-3, and its gradient
+entropy = nif_device.partial_trace([2, 3]).entropy()
+entropy.backward()
+print(entropy.item(), params.grad)  # 0.3389, [0.0370, 0.5396]
+```
+
+### Limits
+
+- The device must start from a computational-basis state (`qml.BasisState`). `partial_trace` raises
+  `NotImplementedError` for a superposed initial state.
+- The trace is the fermionic partial trace. It is the usual qubit partial trace when the kept wires form a
+  contiguous block, such as wires 0 to 3 above. It is not when they leave gaps, such as wires 0 and 2.
+- With a finite number of `shots`, expectation values are estimated from computational-basis samples, so they
+  are only meaningful for observables that are diagonal in that basis.
+
+See the [theory page](https://github.com/MarcoArmenta/MatchCake/blob/dev/docs/partial_trace_theory.md) for the
+details.
 
 ## Data Classification with MatchCake
 
