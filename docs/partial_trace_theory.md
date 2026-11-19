@@ -41,7 +41,8 @@ factors, which is the fermionic (mode) partial trace. When $`A`$ is a contiguous
 no traced-out wire lies between two kept wires, and the reduction coincides with the usual
 qubit partial trace. For a non-contiguous $`A`$ the two differ, and MatchCake implements the
 fermionic one, which keeps the reduced state Gaussian and lets nearest-neighbour matchgates
-of the reduced system act as free-fermion hoppings between the kept modes. The fermionic
+of the reduced system act as free-fermion hoppings between the kept modes. Since it is not the
+partial trace of the qubits, it has to be requested explicitly (`fermionic=True`). The fermionic
 partial trace has a simple meaning in terms of qubits: it is the qubit partial trace of the
 state whose traced-out wires were first moved behind the kept ones with fSWAP gates, both
 groups keeping their order. An fSWAP exchanges two neighbouring fermionic modes, so it permutes
@@ -110,40 +111,50 @@ the eigensolver.
 ## 3. Running a follow-up circuit
 
 Let $`U`$ be a matchgate circuit on the reduced system with transition matrix $`R_2`$, and
-$`O`$ an observable on it. By linearity of the trace,
+$`O`$ an observable on it. The covariance matrix is linear in the state, so the circuit maps
+it exactly as it maps the covariance matrix of a pure state,
+
+```math
+\Lambda_A \mapsto R_2^\top \Lambda_A R_2 ,
+```
+
+and Wick's theorem holds for mixed Gaussian states, so the Pfaffian formulas of the
+expectation values apply to the evolved covariance matrix. Likewise, the probability of an
+outcome $`y`$ on the measured wires $`W`$ is the overlap of two Gaussian states,
+
+```math
+p(y) = \frac{1}{2^{|W|}} \Big| \mathrm{Pf}\big( \Lambda_A|_W + \Lambda_y \big) \Big| ,
+```
+
+with $`\Lambda_y`$ the block-diagonal covariance matrix of $`|y\rangle`$. Nothing in the
+device depends on the purity of its initial state: it only needs an initial covariance matrix
+and, for the states of Section 5, an initial displacement. A reduced state is therefore an
+initial state like any other. MatchCake prepares it with a state-preparation operation that
+holds $`\Lambda_A`$ (`GaussianStatePrep`), and the expectation values, the probabilities, the
+samples and the estimates with a finite number of shots come from the usual pipeline of the
+device, at the cost of a single execution. Tracing out further wires of the evolved state is
+again a principal submatrix.
+
+**Cross-check with the pure states.** By linearity of the trace,
 
 ```math
 \mathrm{Tr}\big[ O\, U \rho_A U^\dagger \big]
 = \sum_x w_x\, \langle x | V_A^\dagger U^\dagger\, O\, U V_A | x \rangle ,
 ```
 
-so the expectation value is the weighted average of the expectation values of the members,
-each of which is an ordinary matchgate-circuit simulation starting from the basis state
-$`|x\rangle`$ with the global transition matrix $`R_A R_2`$. The members can be run one after the
-other or, since the device supports batched state preparations, all at once as a batch of
-$`2^r`$ basis states sharing the same transition matrix. Probabilities of computational-basis
-outcomes are recombined the same way, and samples of the mixture are drawn by first picking
-a member according to the weights $`w_x`$ and then sampling that member.
-
-**Direct evaluation.** The same quantities can be read from the mixed state without
-enumerating its members. The covariance matrix evolves linearly, $`\Lambda_A \mapsto
-R_2^\top \Lambda_A R_2`$, and Wick's theorem holds for mixed Gaussian states, so the
-Pfaffian formulas of the expectation values apply to the evolved covariance matrix. Likewise,
-the probability of an outcome $`y`$ on the measured wires $`W`$ is the overlap of two Gaussian
-states,
-
-```math
-p(y) = \frac{1}{2^{|W|}} \Big| \mathrm{Pf}\big( \Lambda_A|_W + \Lambda_y \big) \Big| ,
-```
-
-with $`\Lambda_y`$ the block-diagonal covariance matrix of $`|y\rangle`$. This route costs a
-single execution instead of $`2^r`$ and is also the natural way to chain reductions: tracing out
-further wires of the evolved mixed state is again a principal submatrix.
+so the same expectation value is the weighted average over the members of the pure-state
+decomposition, each of which is an ordinary simulation starting from the basis state
+$`|x\rangle`$ with the global transition matrix $`R_A R_2`$. This costs $`2^r`$ executions
+instead of one. It is exposed as a way to look inside the state and to validate results, not
+as the way to run a circuit.
 
 ## 4. Gradients
 
 The evolved covariance matrix $`\Lambda_A`$ is a differentiable function of the parameters
-of the first circuit, and the decomposition is made differentiable by a custom backward pass.
+of the first circuit, and a follow-up circuit is differentiated through it by the device, where
+the gradient flows linearly through the covariance matrix. Only the quantities that depend on
+the normal modes (entropy, purity, weights of the pure states) need the decomposition, which is
+made differentiable by a custom backward pass.
 Writing a perturbation of the transition matrix as $`dR_A = \Omega R_A`$ with $`\Omega`$
 antisymmetric, the perturbation of the covariance matrix reads
 
@@ -160,8 +171,8 @@ are projected out, which is exact for any loss that only depends on the reduced 
 modes are always degenerate, $`\lambda_j = \pm 1`$, but physical perturbations cannot push a
 polarization beyond $`1`$, so only the well-defined components appear and the gradient of the
 ensemble is exact there. At an exact degeneracy between two *mixed* modes the decomposition
-itself is not differentiable; the direct evaluation of Section 3, which never builds the
-decomposition, has a well-defined gradient at every point.
+itself is not differentiable; a circuit on the reduced state never builds the decomposition and
+has a well-defined gradient at every point.
 
 ## 5. Product states with superposed qubits
 
@@ -208,7 +219,8 @@ that is when the last wires are traced out. When a wire in front of $`A`$ is tra
 word of the reduced system with an odd number of $`X`$ and $`Y`$ factors corresponds in the
 original system to the same word times a $`Z`$ on that wire. The words with an even number of
 $`X`$ and $`Y`$ factors and the probabilities of the computational-basis outcomes are still
-those of the qubit partial trace. MatchCake issues a warning in that case.
+those of the qubit partial trace. As for separated wires, this reduction has to be requested
+explicitly.
 
 **Normal modes.** An antisymmetric matrix of odd size has a kernel vector, and its normal form
 is
@@ -253,11 +265,13 @@ members $`|0\rangle_p |x\rangle`$ evolved by this transition matrix and the same
 $`w_x`$. A follow-up circuit acts on the wires of $`A`$ only, an even observable is measured as
 it is, and an odd observable is measured together with an $`X`$ on the parity wire.
 
-**Direct evaluation.** A follow-up circuit maps
+**Follow-up circuit.** A follow-up circuit maps
 $`\widetilde\Lambda_A \mapsto (R_2 \oplus 1)^\top \widetilde\Lambda_A (R_2 \oplus 1)`$, and the
 expectation values are read from it with the readout rule of the extended covariance matrix.
-The projectors on the computational-basis outcomes are even, so the probabilities and the
-samples only involve $`\Lambda_A`$ and the formula of Section 3 is unchanged.
+This is what the device already does for a product state, so the displaced reduced state is
+prepared like the others, with its displacement next to its covariance matrix. The projectors
+on the computational-basis outcomes are even, so the probabilities only involve $`\Lambda_A`$
+and the formula of Section 3 is unchanged.
 
 **Gradients.** The backward pass of Section 4 applies to the odd size with one more family of
 gauge directions, the rotations between a mode of zero polarization and the kernel vector.
@@ -340,15 +354,16 @@ between the ancilla and the wires it crosses.
   superposed qubits, the reduction coincides with the qubit partial trace when the kept wires
   are a contiguous block that starts at the first wire. Otherwise the operators with an odd
   number of $`X`$ and $`Y`$ factors are dressed with a $`Z`$ on the traced-out wires in front
-  of them (Section 5).
+  of them (Section 5), and the reduction has to be requested explicitly.
 - The reduction is the fermionic partial trace. For a computational-basis initial state it
   equals the qubit partial trace for a contiguous block of kept wires, and differs from it by
-  Jordan-Wigner strings through the traced-out wires otherwise.
+  Jordan-Wigner strings through the traced-out wires otherwise, in which case it has to be
+  requested explicitly.
 - An ancilla with superposed qubits can only be added behind wires that are in a pure state
   (Section 6). An ancilla in a computational-basis state can be added anywhere.
 - The number of members of the pure-state decomposition grows as $`2^r`$ with the number
-  $`r`$ of mixed modes, at most the number of traced-out wires. The direct evaluation does
-  not have this cost.
+  $`r`$ of mixed modes, at most the number of traced-out wires. Running a circuit on the state
+  does not have this cost, since the device evolves the covariance matrix itself.
 
 ## References
 

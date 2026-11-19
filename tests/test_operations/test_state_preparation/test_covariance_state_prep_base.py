@@ -36,4 +36,6 @@ class TestCovarianceStatePrepBase:
 
     def test_plus_state_displacement(self):
         # <c_0> = <X_0> = 1, and the string of the first wire cancels the displacement of the second.
-        np.testing.assert_allclose(PlusState(wires=[0, 1]).displacement, [1.0, 0.0, 0.0, 0.0], atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(
+            PlusState(wires=[0, 1]).displacement, [1.0, 0.0, 0.0, 0.0], atol=ATOL_MATRIX_COMPARISON
+        )

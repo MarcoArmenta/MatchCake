@@ -1040,7 +1040,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
 
         :param wires: Wires to trace out.
         :type wires: Union[Wires, List[int]]
-        :param kwargs: Forwarded to :meth:`reduced_state`.
+        :param kwargs: Forwarded to :meth:`reduced_state`, for instance ``fermionic=True``.
         :return: The state of the remaining wires, possibly mixed.
         :rtype: MixedGaussianState
         """
@@ -1057,36 +1057,28 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         *,
         reduced_wires: Optional[Union[Wires, List[int]]] = None,
         atol: Optional[float] = None,
+        fermionic: bool = False,
     ) -> "MixedGaussianState":
         r"""
         Keep the given wires of the current state and trace out the others.
 
-        The current state is the initial product state evolved by the operations applied so far. For a
-        computational-basis initial state it is a pure fermionic Gaussian state with covariance matrix
-        :attr:`covariance_matrix`. Its reduced state on the kept wires is again Gaussian, with the principal
-        submatrix of the covariance matrix on the Majorana indices of those wires, and is returned as a
-        :class:`~matchcake.states.MixedGaussianState`. That object decomposes the (generally mixed) reduced
-        state into pure states the device can prepare, so that a follow-up circuit can be run on each of them
-        and the results recombined.
+        The current state is the initial state evolved by the operations applied so far. Its covariance matrix
+        is :attr:`covariance_matrix` and its displacement is the last column of
+        :attr:`extended_covariance_matrix`. The reduced state on the kept wires has the principal submatrix of
+        the covariance matrix on the Majorana indices of those wires, and the displacement of the same indices.
+        It is returned as a :class:`~matchcake.states.MixedGaussianState`, which gives its entropy, purity and
+        normal modes, and whose :meth:`~matchcake.states.MixedGaussianState.state_prep` feeds it into the next
+        circuit.
 
-        The reduction is the fermionic partial trace: the Majorana operators of the reduced state, hence the
-        Jordan-Wigner strings of the operators measured on it, run through the kept wires only. When the kept
-        wires form a contiguous block, this coincides with the qubit partial trace (the initial state has a
-        definite fermion parity). For non-contiguous kept wires, a Pauli word on the reduced state corresponds
-        in the original system to the same word dressed with a :math:`Z` on every traced-out wire that sits
-        between two of its :math:`X` or :math:`Y` factors.
-
-        An initial product state with superposed qubits does not have a definite parity: the state also has a
-        displacement vector :math:`d_\mu = \langle c_\mu \rangle`, the last column of
-        :attr:`extended_covariance_matrix`. The reduced state then carries the displacement of the kept
-        Majorana indices next to the covariance submatrix, as a displaced
-        :class:`~matchcake.states.MixedGaussianState`. A Pauli word with an odd number of :math:`X` and
-        :math:`Y` factors has a nonzero expectation value in such a state, and its Jordan-Wigner string starts
-        at the first wire of the device. The reduction therefore coincides with the qubit partial trace when
-        the kept wires are a contiguous block that starts at the first wire of the device, that is when the
-        last wires are traced out. When a wire in front of the kept wires is traced out, the words with an odd
-        number of :math:`X` and :math:`Y` factors are dressed with a :math:`Z` on that wire and a warning is
-        issued, while the words with an even number of them and the probabilities are unaffected.
+        This reduction is the fermionic partial trace: the Majorana operators of the reduced state, hence the
+        Jordan-Wigner strings of the operators measured on it, run through the kept wires only. It is the qubit
+        partial trace when the kept wires form a contiguous block and, if the state has a displacement (the
+        initial state was a product state with superposed qubits), when that block starts at the first wire of
+        the device. In the other cases the two differ, and the reduction has to be requested with
+        ``fermionic=True``: its result is the qubit partial trace of the state whose traced-out wires were
+        first moved behind the kept ones with fSWAP gates. A Pauli word on the reduced state then corresponds
+        in the original system to the same word with a :math:`Z` on every traced-out wire that has an odd
+        number of its :math:`X` and :math:`Y` factors behind it.
 
         :param wires: Wires to keep. They are ordered as in the device.
         :type wires: Union[Wires, List[int]]
@@ -1096,42 +1088,36 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :param atol: Purity tolerance of the reduced state; see
             :class:`~matchcake.states.MixedGaussianState`. Defaults to its default.
         :type atol: Optional[float]
-        :return: The reduced state, carrying the dtypes and the Pfaffian chunk size of this device.
+        :param fermionic: Whether to allow a reduction that differs from the qubit partial trace. Defaults to
+            ``False``.
+        :type fermionic: bool
+        :return: The reduced state.
         :rtype: MixedGaussianState
-        :raises ValueError: If the initial state is not a product state.
+        :raises ValueError: If the initial state does not provide a covariance matrix, if a wire is not a
+            wire of the device, or if the reduction differs from the qubit partial trace and ``fermionic`` is
+            ``False``.
         """
         from ..states.mixed_gaussian_state import MixedGaussianState
 
-        state_prep = self.state_prep_op
-        if not isinstance(state_prep, ProductState):
+        if not isinstance(self.state_prep_op, CovarianceStatePrepBase):
             raise ValueError(
-                f"The reduced state can only be computed for a ProductState initial state, got {type(state_prep)}."
+                f"The reduced state can only be computed for an initial state that provides a covariance "
+                f"matrix (a basis, product or Gaussian state), got {type(self.state_prep_op)}."
             )
-        is_basis = state_prep.is_basis_state
-        if state_prep.batch_size is not None:
-            is_basis = bool(qml.math.all(is_basis))
         kept = Wires(wires)
         missing = [wire for wire in kept.tolist() if wire not in self.wires]
         if missing:
             raise ValueError(f"Wires {missing} are not wires of the device ({self.wires.tolist()}).")
         state_kwargs: Dict[str, Any] = {} if atol is None else {"atol": atol}
-        covariance_matrix = self.covariance_matrix
-        if not is_basis:
-            extended: Any = self.extended_covariance_matrix  # (..., 2n+1, 2n+1), parity index last
-            covariance_matrix = extended[..., :-1, :-1]
-            state_kwargs["displacement"] = extended[..., :-1, -1]
+        extended: Any = self.extended_covariance_matrix  # (..., 2n+1, 2n+1), parity index last
         full_state = MixedGaussianState(
-            covariance_matrix,
+            extended[..., :-1, :-1],
             wires=range(len(self.wires)),
-            device_kwargs={
-                "r_dtype": self.R_DTYPE,
-                "c_dtype": self.C_DTYPE,
-                "pfaffian_chunk_size": self.pfaffian_chunk_size,
-            },
+            displacement=extended[..., :-1, -1],
             source_wires=self.wires.tolist(),
             **state_kwargs,
         )
-        return full_state.reduced_state(self.wires.indices(kept), reduced_wires=reduced_wires)
+        return full_state.reduced_state(self.wires.indices(kept), reduced_wires=reduced_wires, fermionic=fermionic)
 
     def preprocess_transforms(self, execution_config: Optional[ExecutionConfig] = None) -> CompilePipeline:
         """Return the compile pipeline for preprocessing circuits before execution.
