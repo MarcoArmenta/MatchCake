@@ -53,6 +53,42 @@ class TestCovariance:
             return torch.einsum("...ji,...jk,...kl->...il", sptm, block, sptm)
         return np.einsum("...ji,...jk,...kl->...il", sptm, block, sptm)
 
+    @staticmethod
+    def random_extended_covariance(n_modes: int, seed: int, batch_size=None) -> np.ndarray:
+        """Build a random antisymmetric matrix of odd size by rotating random polarizations and a zero.
+
+        :param n_modes: Number of modes.
+        :type n_modes: int
+        :param seed: Seed of the random generator.
+        :type seed: int
+        :param batch_size: Optional leading batch size.
+        :type batch_size: Optional[int]
+        :return: Real antisymmetric matrix of shape ``(2 * n_modes + 1, 2 * n_modes + 1)`` or batched.
+        :rtype: np.ndarray
+        """
+        rng = np.random.default_rng(seed)
+        size = 2 * n_modes + 1
+        batch_shape = () if batch_size is None else (batch_size,)
+        block = np.zeros(batch_shape + (size, size))
+        block[..., : 2 * n_modes, : 2 * n_modes] = block_diagonal_covariance(
+            rng.uniform(-1.0, 1.0, size=batch_shape + (n_modes,))
+        )
+        generator = rng.normal(size=batch_shape + (size, size))
+        rotation = torch.linalg.matrix_exp(torch.tensor(generator - np.swapaxes(generator, -1, -2))).numpy()
+        return np.einsum("...ij,...ik,...kl->...jl", rotation, block, rotation)
+
+    @staticmethod
+    def reconstruct_extended(sptm, polarizations):
+        """Return ``R^T (Lambda_D + 0) R`` for a transition matrix of odd size, in the backend of the inputs."""
+        n_modes = polarizations.shape[-1]
+        if isinstance(sptm, torch.Tensor):
+            block = torch.zeros_like(sptm)
+            block[..., : 2 * n_modes, : 2 * n_modes] = block_diagonal_covariance(polarizations)
+            return torch.einsum("...ji,...jk,...kl->...il", sptm, block, sptm)
+        block = np.zeros_like(sptm)
+        block[..., : 2 * n_modes, : 2 * n_modes] = block_diagonal_covariance(polarizations)
+        return np.einsum("...ji,...jk,...kl->...il", sptm, block, sptm)
+
     @pytest.mark.parametrize("polarizations", [[1.0], [1.0, -1.0], [0.3, -0.7, 0.0], [[0.5, 0.5], [-0.2, 1.0]]])
     def test_block_diagonal_covariance_entries(self, polarizations):
         polarizations = np.asarray(polarizations)
@@ -262,3 +298,85 @@ class TestCovariance:
 
     def test_degeneracy_atol_is_small(self):
         assert 0.0 < DEGENERACY_ATOL < ATOL_MATRIX_COMPARISON
+
+    @pytest.mark.parametrize("n_modes, batch_size", [(1, None), (2, None), (4, None), (3, 2)])
+    def test_block_diagonalize_covariance_odd_size_reconstructs_input(self, n_modes, batch_size):
+        covariance = self.random_extended_covariance(n_modes, TEST_SEED, batch_size)
+        sptm, polarizations = block_diagonalize_covariance(covariance)
+        assert sptm.shape == covariance.shape
+        assert polarizations.shape == covariance.shape[:-2] + (n_modes,)
+        np.testing.assert_allclose(
+            self.reconstruct_extended(sptm, polarizations),
+            covariance,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+        identity = np.broadcast_to(np.eye(2 * n_modes + 1), sptm.shape)
+        np.testing.assert_allclose(
+            sptm @ np.swapaxes(sptm, -1, -2), identity, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        np.testing.assert_allclose(
+            np.linalg.det(sptm), np.ones(sptm.shape[:-2]), atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+        )
+
+    def test_block_diagonalize_covariance_odd_size_last_row_is_the_kernel_vector(self):
+        covariance = self.random_extended_covariance(3, TEST_SEED + 1)
+        sptm, _ = block_diagonalize_covariance(covariance)
+        np.testing.assert_allclose(covariance @ sptm[-1], np.zeros(7), atol=ATOL_MATRIX_COMPARISON)
+
+    @pytest.mark.parametrize(
+        "covariance",
+        [
+            np.zeros((3, 3)),
+            np.zeros((5, 5)),
+            np.pad(block_diagonal_covariance(np.array([1.0, 0.0])), (0, 1)),
+            np.pad(block_diagonal_covariance(np.array([0.5, 0.5, -0.5])), (0, 1)),
+        ],
+    )
+    def test_block_diagonalize_covariance_odd_size_handles_degenerate_inputs(self, covariance):
+        sptm, polarizations = block_diagonalize_covariance(covariance)
+        np.testing.assert_allclose(
+            self.reconstruct_extended(sptm, polarizations),
+            covariance,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            sptm @ sptm.T, np.eye(sptm.shape[-1]), atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        np.testing.assert_allclose(np.linalg.det(sptm), 1.0, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_block_diagonalize_covariance_odd_size_preserves_backend_and_dtype(self, dtype):
+        covariance = torch.tensor(self.random_extended_covariance(2, TEST_SEED), dtype=dtype)
+        sptm, polarizations = block_diagonalize_covariance(covariance)
+        assert isinstance(sptm, torch.Tensor) and sptm.dtype == dtype
+        assert isinstance(polarizations, torch.Tensor) and polarizations.dtype == dtype
+
+    @pytest.mark.parametrize("n_modes, batch_size", [(1, None), (2, None), (3, None), (2, 2)])
+    def test_block_diagonalize_covariance_odd_size_gradient_of_reconstruction(self, n_modes, batch_size):
+        covariance = torch.tensor(
+            self.random_extended_covariance(n_modes, TEST_SEED + 4, batch_size), requires_grad=True
+        )
+
+        def reconstruction(raw):
+            antisymmetric = 0.5 * (raw - raw.mT)
+            sptm, polarizations = block_diagonalize_covariance(antisymmetric)
+            return self.reconstruct_extended(sptm, polarizations)
+
+        assert torch.autograd.gradcheck(
+            reconstruction, (covariance,), eps=GRADCHECK_EPS, atol=GRADCHECK_ATOL, raise_exception=True
+        )
+
+    def test_block_diagonalize_covariance_odd_size_gradient_of_gauge_invariant_loss(self):
+        covariance = torch.tensor(self.random_extended_covariance(2, TEST_SEED + 5), requires_grad=True)
+        weight = torch.tensor(np.random.default_rng(TEST_SEED).normal(size=(5, 5)))
+
+        def loss(raw):
+            antisymmetric = 0.5 * (raw - raw.mT)
+            sptm, polarizations = block_diagonalize_covariance(antisymmetric)
+            return torch.sum(weight * self.reconstruct_extended(sptm, polarizations)) + torch.sum(polarizations**2)
+
+        assert torch.autograd.gradcheck(
+            loss, (covariance,), eps=GRADCHECK_EPS, atol=GRADCHECK_ATOL, raise_exception=True
+        )
