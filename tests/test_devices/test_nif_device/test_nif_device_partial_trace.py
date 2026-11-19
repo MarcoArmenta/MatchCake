@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pennylane as qml
 import pytest
@@ -71,6 +73,41 @@ class TestNonInteractingFermionicDevicePartialTrace:
         return np.asarray(circuit())
 
     @staticmethod
+    def random_product_amplitudes(n_wires: int, rng: np.random.Generator) -> np.ndarray:
+        """Random normalized single-qubit amplitudes for every wire.
+
+        :param n_wires: Number of wires.
+        :type n_wires: int
+        :param rng: Random generator drawing the amplitudes.
+        :type rng: np.random.Generator
+        :return: Complex array of shape ``(n_wires, 2)``.
+        :rtype: np.ndarray
+        """
+        amplitudes = rng.normal(size=(n_wires, 2)) + 1j * rng.normal(size=(n_wires, 2))
+        return amplitudes / np.linalg.norm(amplitudes, axis=-1, keepdims=True)
+
+    @staticmethod
+    def dense_product_state(amplitudes, operations, n_wires: int) -> np.ndarray:
+        """Apply the dense unitary of a circuit to the tensor product of single-qubit states.
+
+        :param amplitudes: Single-qubit amplitudes of shape ``(n_wires, 2)``.
+        :type amplitudes: np.ndarray
+        :param operations: Operations of the circuit.
+        :type operations: List[Operation]
+        :param n_wires: Number of wires.
+        :type n_wires: int
+        :return: The state vector.
+        :rtype: np.ndarray
+        """
+        psi = np.ones(1, dtype=complex)
+        for qubit_amplitudes in np.asarray(amplitudes):
+            psi = np.kron(psi, qubit_amplitudes)
+        if len(operations) == 0:
+            return psi
+        unitary = np.asarray(qml.matrix(qml.tape.QuantumScript(operations), wire_order=range(n_wires)))
+        return unitary @ psi
+
+    @staticmethod
     def dressed_majorana_product(pauli_word: str, kept_wires, n_wires: int) -> np.ndarray:
         """Dense operator, in the full system, of a Pauli word of the reduced system.
 
@@ -104,6 +141,18 @@ class TestNonInteractingFermionicDevicePartialTrace:
         device = NonInteractingFermionicDevice(wires=n_wires)
         device.apply([qml.BasisState(basis_state, wires=range(n_wires))] + operations)
         psi = self.dense_state(basis_state, operations, n_wires)
+        return device, psi, rng
+
+    @pytest.fixture
+    def prepared_product_device(self):
+        """A 5-wire device after a random circuit on a random product state, with the dense state vector."""
+        rng = np.random.default_rng(TEST_SEED + 1)
+        n_wires = 5
+        amplitudes = self.random_product_amplitudes(n_wires, rng)
+        operations = self.brick_wall(range(n_wires), 2, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        psi = self.dense_product_state(amplitudes, operations, n_wires)
         return device, psi, rng
 
     def test_partial_trace_returns_mixed_gaussian_state_with_device_settings(self, prepared_device):
@@ -255,18 +304,164 @@ class TestNonInteractingFermionicDevicePartialTrace:
         with pytest.raises(ValueError, match="At least one wire"):
             device.partial_trace(list(range(device.num_wires)))
 
-    def test_partial_trace_rejects_superposed_product_state(self):
-        device = NonInteractingFermionicDevice(wires=3)
-        device.apply([PlusState(wires=range(3)), CompRxRx(np.array([0.1, 0.2]), wires=[0, 1])])
-        with pytest.raises(NotImplementedError, match="computational-basis"):
-            device.partial_trace([0])
+    @pytest.mark.parametrize("traced_wires", [[4], [3, 4], [2, 3, 4], [1, 2, 3, 4]])
+    def test_partial_trace_of_product_state_matches_qubit_partial_trace(self, prepared_product_device, traced_wires):
+        device, psi, _ = prepared_product_device
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            state = device.partial_trace(traced_wires)
+        assert state.is_displaced
+        expected = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), traced_wires))
+        np.testing.assert_allclose(
+            state.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
 
-    def test_partial_trace_rejects_batched_superposed_product_state(self):
-        device = NonInteractingFermionicDevice(wires=2)
-        amplitudes = np.array([[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.0], [np.sqrt(0.5), np.sqrt(0.5)]]])
-        device.apply([ProductState(amplitudes, wires=[0, 1])])
-        with pytest.raises(NotImplementedError, match="computational-basis"):
-            device.partial_trace([0])
+    def test_partial_trace_of_product_state_carries_the_displacement(self, prepared_product_device):
+        device, _, _ = prepared_product_device
+        state = device.reduced_state([0, 1])
+        extended = np.asarray(device.extended_covariance_matrix)
+        indices = np.array([0, 1, 2, 3])
+        np.testing.assert_allclose(
+            state.covariance_matrix,
+            extended[np.ix_(indices, indices)],
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            state.displacement, extended[indices, -1], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_partial_trace_of_product_state_follow_up_circuit_matches_dense(self, prepared_product_device, mode):
+        device, psi, rng = prepared_product_device
+        state = device.partial_trace([3, 4])
+        follow_up = self.brick_wall(range(3), 1, rng)
+        unitary = np.asarray(qml.matrix(qml.tape.QuantumScript(follow_up), wire_order=range(3)))
+        reduced = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [3, 4]))
+        evolved = unitary @ reduced @ unitary.conj().T
+        observable = qml.PauliX(0) + 0.5 * qml.PauliZ(0) @ qml.PauliY(1) - 0.3 * qml.PauliX(1) @ qml.PauliX(2)
+        expected = np.trace(evolved @ qml.matrix(observable, wire_order=range(3))).real
+        np.testing.assert_allclose(
+            state.execute(follow_up, observable, "expval", mode=mode),
+            expected,
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            state.execute(follow_up, output_type="probs", mode=mode),
+            np.diag(evolved).real,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+
+    @pytest.mark.parametrize("traced_wires", [[0], [0, 1], [0, 4]])
+    def test_partial_trace_of_product_state_in_front_warns_and_is_the_fermionic_one(
+        self, prepared_product_device, traced_wires
+    ):
+        device, psi, _ = prepared_product_device
+        with pytest.warns(UserWarning, match="fermionic partial trace"):
+            state = device.partial_trace(traced_wires)
+        kept_wires = state.source_wires.tolist()
+        reduced = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), traced_wires))
+        # Probabilities and words with an even number of X and Y factors are those of the qubit partial trace.
+        np.testing.assert_allclose(
+            state.probs(), np.diag(reduced).real, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        for pauli_word in ["XY", "ZI", "YX", "XI", "ZY", "IX"]:
+            word = pauli_word + "I" * (len(kept_wires) - len(pauli_word))
+            observable = qml.pauli.string_to_pauli_word(word)
+            dressed = self.dressed_majorana_product(word, kept_wires, device.num_wires)
+            expected = (psi.conj() @ dressed @ psi).real
+            np.testing.assert_allclose(
+                state.expval(observable), expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+            )
+            if (word.count("X") + word.count("Y")) % 2 == 0:
+                qubit_expected = np.trace(reduced @ qml.matrix(observable, wire_order=range(len(kept_wires)))).real
+                np.testing.assert_allclose(
+                    expected, qubit_expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+                )
+
+    @pytest.mark.parametrize("pauli_word", ["XI", "IX", "ZY", "XX", "YZ"])
+    def test_non_contiguous_partial_trace_of_product_state_is_the_fermionic_one(
+        self, prepared_product_device, pauli_word
+    ):
+        device, psi, _ = prepared_product_device
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            state = device.reduced_state([0, 2])
+        observable = qml.pauli.string_to_pauli_word(pauli_word)
+        dressed = self.dressed_majorana_product(pauli_word, [0, 2], device.num_wires)
+        expected = (psi.conj() @ dressed @ psi).real
+        for mode in ("parallel", "sequential", "direct"):
+            np.testing.assert_allclose(
+                state.execute([], observable, "expval", mode=mode),
+                expected,
+                atol=ATOL_SCALAR_COMPARISON,
+                rtol=RTOL_SCALAR_COMPARISON,
+            )
+
+    def test_partial_trace_of_plus_state(self):
+        n_wires = 3
+        operations = [CompRxRx(np.array([0.1, 0.2]), wires=[0, 1]), CompRyRy(np.array([0.7, -0.4]), wires=[1, 2])]
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([PlusState(wires=range(n_wires))] + operations)
+        state = device.partial_trace([2])
+        psi = self.dense_product_state(np.full((n_wires, 2), np.sqrt(0.5)), operations, n_wires)
+        expected = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [2]))
+        assert state.is_displaced
+        np.testing.assert_allclose(
+            state.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        eigenvalues = np.linalg.eigvalsh(expected)
+        eigenvalues = eigenvalues[eigenvalues > 1e-12]
+        np.testing.assert_allclose(
+            state.entropy(),
+            -np.sum(eigenvalues * np.log(eigenvalues)),
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+
+    def test_partial_trace_of_batched_superposed_product_state(self):
+        rng = np.random.default_rng(TEST_SEED)
+        n_wires = 3
+        amplitudes = np.array(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]],
+                [[1.0, 0.0], [np.sqrt(0.5), np.sqrt(0.5)], [np.sqrt(0.2), 1j * np.sqrt(0.8)]],
+            ]
+        )
+        operations = self.brick_wall(range(n_wires), 1, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        state = device.partial_trace([2])
+        assert state.batch_shape == (2,)
+        assert state.is_displaced
+        observable = qml.PauliX(0) @ qml.PauliZ(1) + 0.4 * qml.PauliY(1)
+        values = {
+            mode: np.asarray(state.execute([], observable, "expval", mode=mode))
+            for mode in ("parallel", "sequential", "direct")
+        }
+        for batch_index in range(2):
+            psi = self.dense_product_state(amplitudes[batch_index], operations, n_wires)
+            expected = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [2]))
+            np.testing.assert_allclose(
+                np.asarray(state.density_matrix())[batch_index],
+                expected,
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+            expected_value = np.trace(expected @ qml.matrix(observable, wire_order=range(2))).real
+            for value in values.values():
+                np.testing.assert_allclose(
+                    value[batch_index], expected_value, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+                )
+
+    def test_partial_trace_of_product_state_keeps_device_dtype(self):
+        device = NonInteractingFermionicDevice(wires=3, r_dtype=torch.float32, c_dtype=torch.complex64)
+        device.apply([PlusState(wires=range(3)), CompRxRx(np.array([0.1, 0.2]), wires=[0, 1])])
+        state = device.partial_trace([2])
+        assert qml.math.get_dtype_name(state.covariance_matrix) == "float32"
+        assert qml.math.get_dtype_name(state.displacement) == "float32"
 
     def test_partial_trace_accepts_batched_basis_product_state(self):
         device = NonInteractingFermionicDevice(wires=2)

@@ -1,17 +1,19 @@
 import itertools
-from functools import cached_property
+import warnings
+from functools import cached_property, reduce
 from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import pennylane as qml
 import torch
 from pennylane.measurements import ExpectationMP, ProbabilityMP
-from pennylane.operation import Operation, Operator, StatePrepBase
+from pennylane.operation import Operation, Operator, StatePrepBase, TermsUndefinedError
 from pennylane.ops.qubit.observables import BasisStateProjector
+from pennylane.pauli import pauli_word_to_string
 from pennylane.wires import Wires, WiresLike
 
 from ..devices.expval_strategies.m_pfaffian import MPfaffianExpvalStrategy
-from ..devices.expval_strategies.m_pfaffian._extended_covariance import extended_covariance_matrix
+from ..devices.expval_strategies.m_pfaffian._extended_covariance import extended_covariance_matrix, sptm_lift
 from ..devices.nif_device import NonInteractingFermionicDevice
 from ..devices.probability_strategies import ProductStateProbabilityStrategy
 from ..devices.sampling_strategies import ProductBasisSampling, get_sampling_strategy
@@ -78,11 +80,37 @@ class MixedGaussianState:
     The covariance matrix may carry a leading batch dimension, ``(B, 2m, 2m)``, for instance when the
     circuit that produced it had batched parameters. The batch is carried through every property and method.
 
+    **Displaced states.** A circuit that starts from a product state with superposed qubits does not have a
+    definite fermion parity, and its reduced states carry a displacement vector
+    :math:`d_\mu = \mathrm{Tr}[\rho\, c_\mu]` next to the covariance matrix. Such a state is Gaussian in the
+    extended algebra of the :math:`2m + 1` operators :math:`(c_0, \ldots, c_{2m-1}, P)`, with :math:`P` the
+    parity of the wires of the state: every expectation value follows from the extended covariance matrix
+
+    .. math::
+        \tilde\Lambda = \begin{pmatrix} \Lambda & d \\ -d^\top & 0 \end{pmatrix}
+        = \tilde R^\top \big(\Lambda_D \oplus 0\big) \tilde R,
+        \qquad
+        \tilde R \in SO(2m + 1),
+
+    whose normal modes give the polarizations, the entropy and the weights :math:`w_x` exactly as above. The
+    rotation :math:`\tilde R` mixes the Majorana operators with the parity, so the members of the pure-state
+    decomposition are no longer basis states evolved by a matchgate circuit on the ``m`` wires. They are on
+    ``m + 1`` wires: with one **parity wire** placed in front of the wires of the state (:attr:`parity_wire`,
+    :attr:`ensemble_wires`), :math:`\tilde R \oplus 1` is an ordinary transition matrix, an operator with an
+    even number of :math:`X` and :math:`Y` factors is measured as it is and an operator with an odd number of
+    them is measured together with an :math:`X` on the parity wire (:meth:`ensemble_observable`).
+    :meth:`execute` does this bookkeeping in the ensemble modes, and the direct mode reads the same numbers
+    from :math:`\tilde\Lambda`. Probabilities and samples in the computational basis do not depend on the
+    displacement.
+
     :param covariance_matrix: Real antisymmetric matrix of shape ``(2m, 2m)`` or ``(B, 2m, 2m)``.
     :type covariance_matrix: TensorLike
     :param wires: Labels of the ``m`` wires of the state. They must be consecutive integers because
         matchgates act on nearest-neighbour wires. Defaults to ``range(m)``.
     :type wires: Optional[WiresLike]
+    :param displacement: Real displacement vector :math:`d_\mu = \mathrm{Tr}[\rho\, c_\mu]` of shape ``(2m,)``
+        or ``(B, 2m)``, matching the batch of the covariance matrix. Defaults to ``None`` (no displacement).
+    :type displacement: Optional[TensorLike]
     :param atol: A mode whose polarization satisfies :math:`|\lambda_j| \geq 1 - \text{atol}` is treated
         as pure and contributes a single member to the decomposition. Defaults to :attr:`DEFAULT_ATOL`.
     :type atol: float
@@ -97,6 +125,7 @@ class MixedGaussianState:
 
     DEFAULT_ATOL = 1e-8
     ANTISYMMETRY_ATOL = 1e-6
+    DISPLACEMENT_ATOL = 1e-12
 
     @staticmethod
     def majorana_indices(wire_positions: Iterable[int]) -> np.ndarray:
@@ -161,6 +190,7 @@ class MixedGaussianState:
         covariance_matrix: TensorLike,
         wires: Optional[WiresLike] = None,
         *,
+        displacement: Optional[TensorLike] = None,
         atol: float = DEFAULT_ATOL,
         device_kwargs: Optional[Dict[str, Any]] = None,
         source_wires: Optional[WiresLike] = None,
@@ -187,7 +217,18 @@ class MixedGaussianState:
                 f"The wires of a {type(self).__name__} must be consecutive integers, got {labels}. "
                 f"Use the default wires or relabel them."
             )
+        if displacement is not None:
+            displacement_shape = tuple(qml.math.shape(displacement))
+            if displacement_shape != shape[:-1]:
+                raise ValueError(
+                    f"The displacement must have shape {shape[:-1]} for a covariance matrix of shape {shape}, "
+                    f"got {displacement_shape}."
+                )
         self._covariance_matrix = covariance_matrix
+        self._displacement = displacement
+        self._is_displaced = displacement is not None and not qml.math.allclose(
+            detach(displacement), 0.0, atol=self.DISPLACEMENT_ATOL
+        )
         self._wires = wires
         self._source_wires = wires if source_wires is None else Wires(source_wires)
         self._atol = float(atol)
@@ -196,9 +237,10 @@ class MixedGaussianState:
             raise ValueError("device_kwargs cannot contain 'shots': pass the number of shots to execute or sample.")
 
     def __repr__(self) -> str:
+        displaced = ", is_displaced=True" if self.is_displaced else ""
         return (
             f"{type(self).__name__}(num_wires={self.num_wires}, batch_shape={self.batch_shape}, "
-            f"num_mixed_modes={self.num_mixed_modes}, num_pure_states={self.num_pure_states})"
+            f"num_mixed_modes={self.num_mixed_modes}, num_pure_states={self.num_pure_states}{displaced})"
         )
 
     def density_matrix(self) -> TensorLike:
@@ -212,7 +254,12 @@ class MixedGaussianState:
             \rho = \frac{1}{2^m} \sum_{|S| \text{ even}} i^{|S| / 2}\, \mathrm{Pf}(\Lambda|_S)\, c_S .
 
         The sum has :math:`2^{2m - 1}` terms: this method is meant for small systems, typically for
-        verification.
+        verification. A displaced state adds the products of an odd number of Majorana operators, whose
+        expectation values are the Pfaffians of the extended covariance matrix on :math:`S` and the parity index,
+
+        .. math::
+            \rho \mathrel{+}= \frac{1}{2^m} \sum_{|S| \text{ odd}} i^{|S|} (-i)^{(|S| + 1) / 2}\,
+            \mathrm{Pf}(\tilde\Lambda|_{S \cup \{2m\}})\, c_S .
 
         :return: Complex matrix of shape ``(2^m, 2^m)`` or ``(B, 2^m, 2^m)``.
         :rtype: TensorLike
@@ -235,6 +282,21 @@ class MixedGaussianState:
             pfaffians = qml.math.cast(convert_like_and_cast_to(pfaffians, covariance), complex_dtype)
             operators = qml.math.cast(convert_like_and_cast_to(operators, covariance), complex_dtype)
             density = density + (1j ** (size // 2)) * qml.math.einsum("...s,sij->...ij", pfaffians, operators)
+        if not self.is_displaced:
+            return density / dimension
+        extended = self.extended_covariance_matrix
+        for size in range(1, 2 * num_wires, 2):
+            index_sets = np.array(list(itertools.combinations(range(2 * num_wires), size)), dtype=int)
+            operators = np.stack(
+                [reduce(np.matmul, [majoranas[mu] for mu in subset]) for subset in index_sets], axis=0
+            )  # (n_terms, 2^m, 2^m)
+            parity_column = np.full((len(index_sets), 1), 2 * num_wires, dtype=int)
+            extended_sets = np.concatenate([index_sets, parity_column], axis=1)  # (n_terms, size + 1)
+            pfaffians = sector_pfaffian_features(extended, extended_sets)  # (..., n_terms)
+            pfaffians = qml.math.cast(convert_like_and_cast_to(pfaffians, covariance), complex_dtype)
+            operators = qml.math.cast(convert_like_and_cast_to(operators, covariance), complex_dtype)
+            phase = (1j**size) * ((-1j) ** ((size + 1) // 2))
+            density = density + phase * qml.math.einsum("...s,sij->...ij", pfaffians, operators)
         return density / dimension
 
     def entropy(self, base: Optional[float] = None) -> TensorLike:
@@ -259,6 +321,37 @@ class MixedGaussianState:
             entropy = entropy / np.log(base)
         return entropy
 
+    def ensemble_observable(self, observable: Operator) -> Operator:
+        r"""
+        Map an observable on the wires of the state to the observable measured on the members of the ensemble.
+
+        Without displacement the members live on the wires of the state and the observable is returned
+        unchanged. The members of a displaced state live on :attr:`ensemble_wires`, where the parity wire holds
+        the fermion parity of the wires of the state: a Pauli word with an even number of :math:`X` and
+        :math:`Y` factors is unchanged, and a word with an odd number of them is multiplied by an :math:`X` on
+        the parity wire. Sums are mapped term by term.
+
+        :param observable: A Pauli observable (word, sum, Hamiltonian), a
+            :class:`~matchcake.observables.BatchHamiltonian` or a basis-state :class:`~pennylane.Projector` on
+            the wires of the state.
+        :type observable: Operator
+        :return: The observable on :attr:`ensemble_wires`.
+        :rtype: Operator
+        :raises NotImplementedError: If the state is displaced and the observable is not a sum of Pauli words.
+        """
+        if not self.is_displaced or isinstance(observable, BasisStateProjector):
+            return observable
+        if isinstance(observable, BatchHamiltonian):
+            return BatchHamiltonian(observable.coeffs, [self.ensemble_observable(term) for term in observable.ops])
+        try:
+            coefficients, words = observable.terms()
+        except TermsUndefinedError:
+            return self._parity_dressed_word(observable)
+        dressed_words = [self._parity_dressed_word(word) for word in words]
+        if all(dressed_word is word for dressed_word, word in zip(dressed_words, words)):
+            return observable
+        return qml.Hamiltonian(coefficients, dressed_words)
+
     def ensemble_operations(self) -> List[Operation]:
         r"""
         Operations preparing every member of the pure-state decomposition as one batched state.
@@ -270,19 +363,25 @@ class MixedGaussianState:
         runs that circuit on every member in one batched execution; the output of member ``k`` of batch
         element ``b`` sits at position ``b * K + k`` of the batch axis of the device.
 
+        The operations act on :attr:`ensemble_wires`: the wires of the state, preceded by the parity wire when
+        the state is displaced. In that case the device must be created on :attr:`ensemble_wires` and the
+        observables mapped with :meth:`ensemble_observable`.
+
         :return: A batched :class:`~matchcake.operations.state_preparation.ProductState` followed by a
             :class:`~matchcake.operations.SingleParticleTransitionMatrixOperation`.
         :rtype: List[Operation]
         """
-        basis = self.basis_states.reshape(-1, self.num_wires)  # (B * K, m)
-        product_state = ProductState.from_basis_state(basis, wires=self.wires)
+        ensemble_wires = self.ensemble_wires
+        basis = self._ensemble_basis_states().reshape(-1, len(ensemble_wires))  # (B * K, m) or (B * K, m + 1)
+        product_state = ProductState.from_basis_state(basis, wires=ensemble_wires)
         sptm = self.sptm
         if len(self.batch_shape) > 0:
             num_members = self.num_pure_states
             sptm = qml.math.reshape(
-                qml.math.stack([sptm] * num_members, axis=1), (basis.shape[0], 2 * self.num_wires, 2 * self.num_wires)
+                qml.math.stack([sptm] * num_members, axis=1),
+                (basis.shape[0], 2 * len(ensemble_wires), 2 * len(ensemble_wires)),
             )
-        return [product_state, SingleParticleTransitionMatrixOperation(sptm, wires=self.wires)]
+        return [product_state, SingleParticleTransitionMatrixOperation(sptm, wires=ensemble_wires)]
 
     def evolve(self, operations: Iterable[Operation], **device_kwargs) -> "MixedGaussianState":
         r"""
@@ -291,7 +390,8 @@ class MixedGaussianState:
         The circuit is compiled to its single-particle transition matrix :math:`R_2` by a
         :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` on the wires of the state, and
         the covariance matrix is mapped to :math:`R_2^\top \Lambda R_2`. Since the map is linear in the
-        state, the result is exactly the mixture of the evolved members of :meth:`pure_states`.
+        state, the result is exactly the mixture of the evolved members of :meth:`pure_states`. A
+        displacement is mapped to :math:`R_2^\top d`, since matchgates preserve the parity.
 
         :param operations: Operations of the circuit, acting on the wires of the state. State preparations
             are not allowed.
@@ -311,11 +411,17 @@ class MixedGaussianState:
         else:
             circuit_sptm = convert_and_cast_like(circuit_sptm, covariance)
         evolved = qml.math.einsum("...ij,...ik,...kl->...jl", circuit_sptm, covariance, circuit_sptm)
+        displacement = None
+        if self._displacement is not None:
+            displacement = qml.math.einsum(
+                "...ij,...i->...j", circuit_sptm, convert_and_cast_like(self._displacement, circuit_sptm)
+            )
         return self._new(
             evolved,
             wires=self.wires,
             source_wires=self.source_wires,
             device_kwargs={**self.device_kwargs, **device_kwargs},
+            displacement=displacement,
         )
 
     def execute(
@@ -348,6 +454,11 @@ class MixedGaussianState:
         and ``"expval"`` and ``"probs"`` are estimated from such samples exactly like the device does. As with
         the device, a sample-based expectation value is only meaningful for an observable that is diagonal
         in the computational basis.
+
+        For a displaced state, the ensemble modes compute an expectation value on :attr:`ensemble_wires`, with
+        the observable mapped by :meth:`ensemble_observable`. Probabilities and samples do not depend on the
+        displacement, so the ensemble modes compute them from the pure-state decomposition of the same state
+        without its displacement.
 
         :param operations: Operations of the follow-up circuit, acting on the wires of the state.
         :type operations: Iterable[Operation]
@@ -399,6 +510,16 @@ class MixedGaussianState:
             if output_type == "probs":
                 return evolved.probs(wires=kwargs.get("wires", None))
             return evolved.sample(shots)
+
+        if self.is_displaced and output_type != "expval":
+            return self._without_displacement().execute(
+                operations,
+                output_type=output_type,
+                mode=mode,
+                shots=shots,
+                device_kwargs=merged_device_kwargs,
+                **kwargs,
+            )
 
         if mode == "parallel":
             return self._execute_parallel(
@@ -489,7 +610,8 @@ class MixedGaussianState:
         Operations preparing the member ``index`` of the pure-state decomposition.
 
         Prepending them to a circuit on a :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice`
-        with the wires of the state runs that circuit on :math:`V_R |x_\text{index}\rangle`.
+        with the wires of the state runs that circuit on :math:`V_R |x_\text{index}\rangle`. For a displaced
+        state the operations and the device are on :attr:`ensemble_wires`, see :meth:`ensemble_operations`.
 
         :param index: Index of the member, in ``range(num_pure_states)``.
         :type index: int
@@ -497,8 +619,8 @@ class MixedGaussianState:
             :class:`~matchcake.operations.SingleParticleTransitionMatrixOperation` of :math:`R`.
         :rtype: List[Operation]
         """
-        bits = self.basis_states[..., index, :]
-        return [ProductState.from_basis_state(bits, wires=self.wires), self.sptm_operation]
+        bits = self._ensemble_basis_states()[..., index, :]
+        return [ProductState.from_basis_state(bits, wires=self.ensemble_wires), self.sptm_operation]
 
     def pure_states(self) -> Iterator[Tuple[TensorLike, ProductState, SingleParticleTransitionMatrixOperation]]:
         r"""
@@ -506,7 +628,8 @@ class MixedGaussianState:
 
         :return: Triples ``(weight, product_state, sptm_operation)``: the weight :math:`w_x` (of shape ``()``
             or ``(B,)``), the basis-state preparation :math:`|x\rangle` and the transition-matrix operation
-            :math:`R`, such that the member is :math:`V_R |x\rangle`.
+            :math:`R`, such that the member is :math:`V_R |x\rangle`. For a displaced state both operations
+            act on :attr:`ensemble_wires`.
         :rtype: Iterator[Tuple[TensorLike, ProductState, SingleParticleTransitionMatrixOperation]]
         """
         sptm_operation = self.sptm_operation
@@ -524,6 +647,12 @@ class MixedGaussianState:
         matrix on the Majorana indices of the kept wires, which is the fermionic partial trace: the Jordan-Wigner
         strings of the reduced system run through the kept wires only. It coincides with the qubit partial trace
         when the kept wires form a contiguous block.
+
+        The displacement of a displaced state is restricted to the same indices. An operator with an odd
+        number of :math:`X` and :math:`Y` factors keeps its whole Jordan-Wigner string, which starts at the
+        first wire of the state, so for a displaced state the reduction coincides with the qubit partial trace
+        when the kept wires form a contiguous block that starts at the first wire. A warning is issued when a
+        wire in front of the kept wires is traced out of a displaced state.
 
         :param wires: Wires to keep.
         :type wires: WiresLike
@@ -543,7 +672,22 @@ class MixedGaussianState:
         covariance_matrix: Any = self.covariance_matrix
         covariance = covariance_matrix[..., indices[:, None], indices[None, :]]
         source_wires = [self.source_wires.tolist()[position] for position in positions]
-        return self._new(covariance, wires=reduced_wires, source_wires=source_wires)
+        displacement = None
+        if self._displacement is not None:
+            displacement_vector: Any = self._displacement
+            displacement = displacement_vector[..., indices]
+        if self.is_displaced and positions[0] != 0:
+            warnings.warn(
+                f"Wires in front of the kept wires are traced out of a displaced {type(self).__name__} (its "
+                f"circuit started from a product state with superposed qubits). The reduced state is the "
+                f"fermionic partial trace: its Pauli words with an odd number of X and Y factors correspond to "
+                f"the same words multiplied by a Z on every traced-out wire in front of them, and differ from "
+                f"the qubit partial trace. Words with an even number of X and Y factors and probabilities are "
+                f"not affected. Trace out the last wires of the register to obtain the qubit partial trace.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self._new(covariance, wires=reduced_wires, source_wires=source_wires, displacement=displacement)
 
     def sample(self, shots: Optional[int], sampling_strategy: Optional[str] = None, **device_kwargs) -> np.ndarray:
         r"""
@@ -597,6 +741,22 @@ class MixedGaussianState:
                 )
         return operations
 
+    def _ensemble_basis_states(self) -> np.ndarray:
+        """Basis states of the members of the pure-state decomposition, on :attr:`ensemble_wires`.
+
+        The parity wire of a displaced state starts in the zero state for every member: its two values
+        prepare states with the same expectation values on the wires of the state.
+
+        :return: Integer array of shape ``(K, m)`` or ``(B, K, m)``, with ``m + 1`` instead of ``m`` for a
+            displaced state.
+        :rtype: np.ndarray
+        """
+        basis = self.basis_states
+        if not self.is_displaced:
+            return basis
+        parity_bits = np.zeros(basis.shape[:-1] + (1,), dtype=int)
+        return np.concatenate([parity_bits, basis], axis=-1)
+
     def _execute_parallel(
         self,
         operations: List[Operation],
@@ -612,10 +772,10 @@ class MixedGaussianState:
         :return: The recombined output.
         :rtype: Any
         """
-        device = self._make_device(shots=shots, **device_kwargs)
+        device = self._make_device(ensemble=True, shots=shots, **device_kwargs)
         result = device.execute_generator(
             self.ensemble_operations() + operations,
-            observable=observable,
+            observable=None if observable is None else self.ensemble_observable(observable),
             output_type=output_type,
             reset=True,
             **kwargs,
@@ -653,11 +813,12 @@ class MixedGaussianState:
         :return: The recombined output.
         :rtype: Any
         """
-        device = self._make_device(shots=shots, **device_kwargs)
+        device = self._make_device(ensemble=True, shots=shots, **device_kwargs)
+        member_observable = None if observable is None else self.ensemble_observable(observable)
         results = [
             device.execute_generator(
                 self.pure_state_operations(index) + operations,
-                observable=observable,
+                observable=member_observable,
                 output_type=output_type,
                 reset=True,
                 **kwargs,
@@ -677,21 +838,25 @@ class MixedGaussianState:
             total = term if total is None else total + term
         return total
 
-    def _make_device(self, **device_kwargs) -> NonInteractingFermionicDevice:
+    def _make_device(self, ensemble: bool = False, **device_kwargs) -> NonInteractingFermionicDevice:
         """Create a device on the wires of the state.
 
+        :param ensemble: Whether to create the device on :attr:`ensemble_wires`, to run the members of the
+            pure-state decomposition, instead of the wires of the state. Defaults to ``False``.
+        :type ensemble: bool
         :param device_kwargs: Overrides of the device keyword arguments of the state.
         :return: The device.
         :rtype: NonInteractingFermionicDevice
-        :raises ValueError: If the state has a single wire, which the device does not support.
+        :raises ValueError: If the device would have a single wire, which it does not support.
         """
-        if self.num_wires < 2:
+        wires = self.ensemble_wires if ensemble else self.wires
+        if len(wires) < 2:
             raise ValueError(
                 f"A {type(self).__name__} on {self.num_wires} wire cannot create a NonInteractingFermionicDevice, "
                 f"which requires at least two wires: evolve, execute and sample are not available on it, while "
                 f"expval, probs, entropy and purity are."
             )
-        return NonInteractingFermionicDevice(wires=self.wires, **{**self.device_kwargs, **device_kwargs})
+        return NonInteractingFermionicDevice(wires=wires, **{**self.device_kwargs, **device_kwargs})
 
     def _new(
         self,
@@ -699,6 +864,7 @@ class MixedGaussianState:
         wires: Optional[WiresLike],
         source_wires: Optional[WiresLike],
         device_kwargs: Optional[Dict[str, Any]] = None,
+        displacement: Optional[TensorLike] = None,
     ) -> "MixedGaussianState":
         """Build a state sharing the settings of this one.
 
@@ -710,16 +876,42 @@ class MixedGaussianState:
         :type source_wires: Optional[WiresLike]
         :param device_kwargs: Device keyword arguments of the new state. Defaults to those of this state.
         :type device_kwargs: Optional[Dict[str, Any]]
+        :param displacement: Displacement vector of the new state. Defaults to ``None`` (no displacement).
+        :type displacement: Optional[TensorLike]
         :return: The new state.
         :rtype: MixedGaussianState
         """
         return type(self)(
             covariance_matrix,
             wires=wires,
+            displacement=displacement,
             atol=self.atol,
             device_kwargs=self.device_kwargs if device_kwargs is None else device_kwargs,
             source_wires=source_wires,
         )
+
+    def _parity_dressed_word(self, word: Operator) -> Operator:
+        """Multiply a Pauli word with an odd number of X and Y factors by an X on the parity wire.
+
+        :param word: A Pauli word on the wires of the state.
+        :type word: Operator
+        :return: The word itself when it has an even number of X and Y factors, its product with an X on the
+            parity wire otherwise.
+        :rtype: Operator
+        :raises NotImplementedError: If the operator is not a Pauli word on the wires of the state.
+        """
+        wire_map = {wire: position for position, wire in enumerate(self.wires.tolist())}
+        try:
+            pauli_string = pauli_word_to_string(word, wire_map=wire_map)
+        except Exception as error:
+            raise NotImplementedError(
+                f"The expectation value of {word} cannot be computed on the pure-state decomposition of a "
+                f"displaced {type(self).__name__}. Use a Pauli observable, a basis-state Projector or a "
+                f"BatchHamiltonian on the wires of the state."
+            ) from error
+        if (pauli_string.count("X") + pauli_string.count("Y")) % 2 == 0:
+            return word
+        return qml.prod(qml.PauliX(self.parity_wire), word)
 
     def _process_samples(
         self,
@@ -814,6 +1006,18 @@ class MixedGaussianState:
         labels = [self.wires[int(position)] for position in Wires(wire_positions).tolist()]
         return self._states_probability(target_binary_states, labels)
 
+    def _without_displacement(self) -> "MixedGaussianState":
+        """Return the state with the same covariance matrix and no displacement.
+
+        It is the average of the state and of its image under the fermion parity. Both have the same
+        expectation values of the operators with an even number of X and Y factors, hence the same
+        computational-basis probabilities, before and after any matchgate circuit.
+
+        :return: The state without its displacement.
+        :rtype: MixedGaussianState
+        """
+        return self._new(self.covariance_matrix, wires=self.wires, source_wires=self.source_wires)
+
     def _mixed_combinations(self) -> np.ndarray:
         """Every assignment of the bits of the mixed modes, in lexicographic order.
 
@@ -872,19 +1076,53 @@ class MixedGaussianState:
         """
         return self._covariance_matrix
 
+    @property
+    def displacement(self) -> TensorLike:
+        r"""The displacement vector :math:`d_\mu = \mathrm{Tr}[\rho\, c_\mu]` of the state, of shape ``(..., 2m)``.
+
+        It vanishes for a state with a definite fermion parity.
+
+        :return: The displacement vector.
+        :rtype: TensorLike
+        """
+        if self._displacement is None:
+            covariance = self.covariance_matrix
+            return convert_and_cast_like(np.zeros(self.batch_shape + (2 * self.num_wires,)), covariance)
+        return self._displacement
+
+    @property
+    def ensemble_wires(self) -> Wires:
+        """The wires on which the members of the pure-state decomposition are prepared.
+
+        They are the wires of the state, preceded by :attr:`parity_wire` when the state is displaced.
+
+        :return: The wires of the members.
+        :rtype: Wires
+        """
+        if not self.is_displaced:
+            return self.wires
+        return Wires([self.parity_wire] + self.wires.tolist())
+
     @cached_property
     def extended_covariance_matrix(self) -> TensorLike:
-        """The covariance matrix bordered by a zero displacement, of shape ``(..., 2m+1, 2m+1)``.
+        """The covariance matrix bordered by the displacement, of shape ``(..., 2m+1, 2m+1)``.
 
-        The state has a definite parity, so the parity row and column of the extended covariance matrix of
-        the m-Pfaffian strategy vanish.
+        The last index is the parity index of the m-Pfaffian strategy. Its row and column vanish for a state
+        with a definite parity.
 
         :return: The extended covariance matrix.
         :rtype: TensorLike
         """
-        covariance = self.covariance_matrix
-        displacement = convert_and_cast_like(np.zeros(self.batch_shape + (2 * self.num_wires,)), covariance)
-        return extended_covariance_matrix(covariance, displacement)
+        return extended_covariance_matrix(self.covariance_matrix, self.displacement)
+
+    @property
+    def is_displaced(self) -> bool:
+        """Whether the state has a nonzero displacement vector, within :attr:`DISPLACEMENT_ATOL`.
+
+        :return: ``True`` for a displaced state.
+        :rtype: bool
+        """
+        return self._is_displaced
 
     @property
     def is_pure(self) -> TensorLike:
@@ -945,6 +1183,19 @@ class MixedGaussianState:
         return len(self._wires)
 
     @property
+    def parity_wire(self) -> Optional[int]:
+        """The label of the wire that holds the fermion parity in the members of a displaced state.
+
+        It sits in front of the wires of the state, so its label is the first wire label minus one.
+
+        :return: The label, or ``None`` when the state is not displaced.
+        :rtype: Optional[int]
+        """
+        if not self.is_displaced:
+            return None
+        return int(self.wires.tolist()[0]) - 1
+
+    @property
     def purity(self) -> TensorLike:
         r"""
         Purity :math:`\mathrm{Tr}[\rho^2] = \prod_j \tfrac{1 + \lambda_j^2}{2}` of the state.
@@ -969,19 +1220,32 @@ class MixedGaussianState:
         r"""
         Single-particle transition matrix :math:`R \in SO(2m)` of the normal-mode decomposition.
 
-        :return: Matrix of shape ``(2m, 2m)`` or ``(B, 2m, 2m)``.
+        For a displaced state it is the transition matrix on :attr:`ensemble_wires`, in :math:`SO(2m + 2)`:
+        the rotation :math:`\tilde R \in SO(2m + 1)` of the extended covariance matrix, completed by the
+        identity and written in the Majorana operators of the :math:`m + 1` wires. With the parity wire in
+        front, these are :math:`X_p`, :math:`Y_p` and :math:`Z_p c_\mu`, and the parity index of the extended
+        covariance matrix is carried by :math:`Y_p`.
+
+        :return: Matrix of shape ``(2m, 2m)`` or ``(B, 2m, 2m)``, with ``2m + 2`` instead of ``2m`` for a
+            displaced state.
         :rtype: TensorLike
         """
-        return self._decomposition[0]
+        transition_matrix: Any = self._decomposition[0]
+        if not self.is_displaced:
+            return transition_matrix
+        lifted: Any = sptm_lift(transition_matrix)  # (..., 2m+2, 2m+2), parity index 2m and a spare index 2m+1
+        num_majoranas = 2 * self.num_wires
+        order = np.array([num_majoranas + 1, num_majoranas] + list(range(num_majoranas)), dtype=int)
+        return lifted[..., order[:, None], order[None, :]]
 
     @property
     def sptm_operation(self) -> SingleParticleTransitionMatrixOperation:
-        """The transition matrix :math:`R` as an operation on the wires of the state.
+        """The transition matrix :math:`R` as an operation on :attr:`ensemble_wires`.
 
         :return: The operation.
         :rtype: SingleParticleTransitionMatrixOperation
         """
-        return SingleParticleTransitionMatrixOperation(self.sptm, wires=self.wires)
+        return SingleParticleTransitionMatrixOperation(self.sptm, wires=self.ensemble_wires)
 
     @cached_property
     def weights(self) -> TensorLike:
@@ -1018,7 +1282,12 @@ class MixedGaussianState:
     def _decomposition(self) -> Tuple[TensorLike, TensorLike]:
         """The block-diagonalization ``(R, polarizations)`` of the covariance matrix.
 
+        A displaced state is decomposed through its extended covariance matrix, and ``R`` then has shape
+        ``(..., 2m+1, 2m+1)``.
+
         :return: The transition matrix and the polarizations.
         :rtype: Tuple[TensorLike, TensorLike]
         """
+        if self.is_displaced:
+            return block_diagonalize_covariance(self.extended_covariance_matrix)
         return block_diagonalize_covariance(self.covariance_matrix)

@@ -1055,12 +1055,13 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         r"""
         Keep the given wires of the current state and trace out the others.
 
-        The current state is the initial computational-basis state evolved by the operations applied so far,
-        a pure fermionic Gaussian state with covariance matrix :attr:`covariance_matrix`. Its reduced state on
-        the kept wires is again Gaussian, with the principal submatrix of the covariance matrix on the Majorana
-        indices of those wires, and is returned as a :class:`~matchcake.states.MixedGaussianState`. That object
-        decomposes the (generally mixed) reduced state into pure states the device can prepare, so that a
-        follow-up circuit can be run on each of them and the results recombined.
+        The current state is the initial product state evolved by the operations applied so far. For a
+        computational-basis initial state it is a pure fermionic Gaussian state with covariance matrix
+        :attr:`covariance_matrix`. Its reduced state on the kept wires is again Gaussian, with the principal
+        submatrix of the covariance matrix on the Majorana indices of those wires, and is returned as a
+        :class:`~matchcake.states.MixedGaussianState`. That object decomposes the (generally mixed) reduced
+        state into pure states the device can prepare, so that a follow-up circuit can be run on each of them
+        and the results recombined.
 
         The reduction is the fermionic partial trace: the Majorana operators of the reduced state, hence the
         Jordan-Wigner strings of the operators measured on it, run through the kept wires only. When the kept
@@ -1069,9 +1070,17 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         in the original system to the same word dressed with a :math:`Z` on every traced-out wire that sits
         between two of its :math:`X` or :math:`Y` factors.
 
-        Only computational-basis initial states are supported: a product state with superposed qubits carries a
-        nonzero displacement, and its reduced state is not a Gaussian state of the Majorana algebra of the kept
-        wires alone.
+        An initial product state with superposed qubits does not have a definite parity: the state also has a
+        displacement vector :math:`d_\mu = \langle c_\mu \rangle`, the last column of
+        :attr:`extended_covariance_matrix`. The reduced state then carries the displacement of the kept
+        Majorana indices next to the covariance submatrix, as a displaced
+        :class:`~matchcake.states.MixedGaussianState`. A Pauli word with an odd number of :math:`X` and
+        :math:`Y` factors has a nonzero expectation value in such a state, and its Jordan-Wigner string starts
+        at the first wire of the device. The reduction therefore coincides with the qubit partial trace when
+        the kept wires are a contiguous block that starts at the first wire of the device, that is when the
+        last wires are traced out. When a wire in front of the kept wires is traced out, the words with an odd
+        number of :math:`X` and :math:`Y` factors are dressed with a :math:`Z` on that wire and a warning is
+        issued, while the words with an even number of them and the probabilities are unaffected.
 
         :param wires: Wires to keep. They are ordered as in the device.
         :type wires: Union[Wires, List[int]]
@@ -1083,7 +1092,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :type atol: Optional[float]
         :return: The reduced state, carrying the dtypes and the Pfaffian chunk size of this device.
         :rtype: MixedGaussianState
-        :raises NotImplementedError: If the initial state is not a computational-basis state.
+        :raises ValueError: If the initial state is not a product state.
         """
         from ..states.mixed_gaussian_state import MixedGaussianState
 
@@ -1095,19 +1104,18 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         is_basis = state_prep.is_basis_state
         if state_prep.batch_size is not None:
             is_basis = bool(qml.math.all(is_basis))
-        if not is_basis:
-            raise NotImplementedError(
-                "The partial trace is only implemented for computational-basis initial states. A product state "
-                "with superposed qubits has a nonzero displacement vector and its reduced state is not a "
-                "Gaussian state of the Majorana algebra of the kept wires."
-            )
         kept = Wires(wires)
         missing = [wire for wire in kept.tolist() if wire not in self.wires]
         if missing:
             raise ValueError(f"Wires {missing} are not wires of the device ({self.wires.tolist()}).")
-        state_kwargs = {} if atol is None else {"atol": atol}
+        state_kwargs: Dict[str, Any] = {} if atol is None else {"atol": atol}
+        covariance_matrix = self.covariance_matrix
+        if not is_basis:
+            extended: Any = self.extended_covariance_matrix  # (..., 2n+1, 2n+1), parity index last
+            covariance_matrix = extended[..., :-1, :-1]
+            state_kwargs["displacement"] = extended[..., :-1, -1]
         full_state = MixedGaussianState(
-            self.covariance_matrix,
+            covariance_matrix,
             wires=range(len(self.wires)),
             device_kwargs={
                 "r_dtype": self.R_DTYPE,

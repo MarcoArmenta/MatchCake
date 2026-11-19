@@ -196,7 +196,8 @@ Install it with `pip install "git+https://github.com/MarcoArmenta/MatchCake@dev"
 A matchgate circuit keeps the state of the device fermionic Gaussian, so tracing out wires gives a state that is
 generally mixed but still Gaussian. `matchcake.states.MixedGaussianState` stores such a state as the covariance
 matrix of its wires (2m x 2m for m wires). Entropies, expectation values, probabilities and samples are computed
-from that matrix, without building the density matrix.
+from that matrix, without building the density matrix. When the circuit starts from a product state with
+superposed qubits, the state also carries a displacement vector (2m numbers).
 
 ### Tracing out wires of a circuit
 
@@ -287,6 +288,46 @@ print(evolved.partial_trace([3]).entropy())  # 1.2036
 same_state = MixedGaussianState(evolved.covariance_matrix)
 ```
 
+### Tracing out an ancilla prepared in a product state
+
+The initial state can be any product state, for instance a system in a basis state next to an ancilla in a
+random product state. Put the wires to trace out last: keeping a block of wires that starts at the first wire
+gives the usual qubit partial trace.
+
+```python
+import matchcake as mc
+import pennylane as qml
+import numpy as np
+from matchcake.operations.state_preparation import ProductState
+
+rng = np.random.default_rng(0)
+# Wires 0-2 are the system, in |010>. Wires 3-4 are the ancilla, in a random product state.
+system = np.eye(2)[[0, 1, 0]]
+ancilla = rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2))
+ancilla /= np.linalg.norm(ancilla, axis=-1, keepdims=True)
+
+nif_device = mc.NonInteractingFermionicDevice(wires=5)
+nif_device.apply([
+    ProductState(np.concatenate([system, ancilla]), wires=range(5)),
+    mc.operations.CompRxRx(np.array([0.3, 0.7]), wires=[2, 3]),
+    mc.operations.CompRyRy(np.array([0.2, 1.1]), wires=[3, 4]),
+    mc.operations.CompRzRz(np.array([0.8, 0.1]), wires=[1, 2]),
+    mc.operations.CompRxRx(np.array([0.9, 0.4]), wires=[2, 3]),
+])
+
+system_state = nif_device.partial_trace([3, 4])
+print(system_state.is_displaced)           # True
+print(system_state.entropy())              # 0.3598
+print(system_state.expval(qml.PauliX(2)))  # -0.1558
+
+follow_up = [mc.operations.CompRyRy(np.array([0.5, 0.6]), wires=[1, 2])]
+observable = qml.PauliX(2) + 0.5 * qml.PauliZ(0) @ qml.PauliZ(1)
+print(system_state.execute(follow_up, observable, "expval"))  # -0.5757
+```
+
+Such a state is called displaced: operators with an odd number of X and Y factors, like `qml.PauliX(2)` above,
+have a nonzero expectation value in it. Everything else works as for the other mixed states.
+
 ### Gradients
 
 With PyTorch parameters, the reduced state and everything computed from it are differentiable.
@@ -314,10 +355,12 @@ print(entropy.item(), params.grad)  # 0.3389, [0.0370, 0.5396]
 
 ### Limits
 
-- The device must start from a computational-basis state (`qml.BasisState`). `partial_trace` raises
-  `NotImplementedError` for a superposed initial state.
+- The device must start from a product state: a computational-basis state (`qml.BasisState`) or a
+  `ProductState`.
 - The trace is the fermionic partial trace. It is the usual qubit partial trace when the kept wires form a
   contiguous block, such as wires 0 to 3 above. It is not when they leave gaps, such as wires 0 and 2.
+- When the initial state has superposed qubits, the kept block must also start at the first wire for the trace
+  to be the qubit partial trace. `partial_trace` warns when a wire in front of the kept wires is traced out.
 - With a finite number of `shots`, expectation values are estimated from computational-basis samples, so they
   are only meaningful for observables that are diagonal in that basis.
 

@@ -36,33 +36,40 @@ class _BlockDiagonalizeCovariance(torch.autograd.Function):
     a QR factorization. The polarizations are read from the actual product :math:`R \\Lambda R^\\top`, which
     makes the forward pass insensitive to the signs and the pairing chosen by the linear algebra kernels.
 
+    A matrix of odd size :math:`2m + 1` (an extended covariance matrix) always has a kernel vector. The same
+    construction applies with :math:`R \\in SO(2m + 1)` and :math:`\\Lambda_D \\oplus 0`: the QR factorization
+    completes the :math:`2m` mode vectors with that kernel vector, which becomes the last row of :math:`R`.
+
     The backward pass maps the gradients with respect to :math:`R` and :math:`\\lambda` back to a gradient
     with respect to :math:`\\Lambda`. A perturbation :math:`dR = \\Omega R` with :math:`\\Omega` antisymmetric
     gives :math:`R\\, d\\Lambda\\, R^\\top = [\\Lambda_D, \\Omega] + d\\Lambda_D`, which is inverted block by block.
-    Directions that leave :math:`\\Lambda` unchanged (rotations inside a mode, and rotations between two modes
-    with equal polarizations or with opposite polarizations) are gauge freedoms of the decomposition. Their
-    inverse is not defined, so they are projected out: a loss that only depends on :math:`\\Lambda` has no
-    gradient component along them.
+    Directions that leave :math:`\\Lambda` unchanged (rotations inside a mode, rotations between two modes
+    with equal polarizations or with opposite polarizations and, for an odd size, rotations between a mode of
+    zero polarization and the kernel vector) are gauge freedoms of the decomposition. Their inverse is not
+    defined, so they are projected out: a loss that only depends on :math:`\\Lambda` has no gradient component
+    along them.
     """
 
     @staticmethod
     def forward(ctx, covariance_matrix: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         covariance_matrix = 0.5 * (covariance_matrix - covariance_matrix.mT)
-        n_modes = covariance_matrix.shape[-1] // 2
+        size = covariance_matrix.shape[-1]  # 2m, or 2m + 1 for an extended covariance matrix
+        n_modes = size // 2
         complex_dtype = torch.complex64 if covariance_matrix.dtype == torch.float32 else torch.complex128
         hermitian = 1j * covariance_matrix.to(complex_dtype)
         _, eigenvectors = torch.linalg.eigh(hermitian)  # eigenvalues ascending: (-lambda_j, ..., +lambda_j)
         # The last n_modes columns hold the non-negative eigenvalues. Reverse them so that the modes with the
         # largest eigenvalues come first and the (possibly degenerate) zero modes are last.
-        positive_vectors = torch.flip(eigenvectors[..., :, n_modes:], dims=[-1])  # (..., 2m, m)
+        positive_vectors = torch.flip(eigenvectors[..., :, size - n_modes :], dims=[-1])  # (..., size, m)
         real_columns = np.sqrt(2.0) * torch.real(positive_vectors)  # u_j
         imag_columns = np.sqrt(2.0) * torch.imag(positive_vectors)  # w_j
-        interleaved = torch.stack([real_columns, imag_columns], dim=-1)  # (..., 2m, m, 2)
-        raw_basis = interleaved.reshape(*covariance_matrix.shape[:-2], 2 * n_modes, 2 * n_modes)
+        interleaved = torch.stack([real_columns, imag_columns], dim=-1)  # (..., size, m, 2)
+        raw_basis = interleaved.reshape(*covariance_matrix.shape[:-2], size, 2 * n_modes)
         # A QR factorization re-orthonormalizes the columns. The columns of the modes with a positive
         # eigenvalue are already orthonormal and are kept up to a sign, while the columns of the zero
-        # modes are completed to an orthonormal basis of the kernel of the covariance matrix.
-        orthonormal_basis, _ = torch.linalg.qr(raw_basis, mode="complete")
+        # modes are completed to an orthonormal basis of the kernel of the covariance matrix. For an odd
+        # size, the complete factorization appends the remaining kernel vector as the last column.
+        orthonormal_basis, _ = torch.linalg.qr(raw_basis, mode="complete")  # (..., size, size)
         sptm = orthonormal_basis.mT  # rows are the orthonormal vectors
         # Enforce a unit determinant by flipping the sign of the second row when needed. The flip changes
         # the sign of the first polarization, which is read from the actual product below.
@@ -71,7 +78,9 @@ class _BlockDiagonalizeCovariance(torch.autograd.Function):
         row_signs[..., 1] = determinant_sign
         sptm = sptm * row_signs[..., :, None]
         block_diagonal = sptm @ covariance_matrix @ sptm.mT
-        polarizations = -block_diagonal[..., 0::2, 1::2].diagonal(dim1=-2, dim2=-1)  # (..., m)
+        polarizations = -block_diagonal[..., 0 : 2 * n_modes : 2, 1 : 2 * n_modes : 2].diagonal(
+            dim1=-2, dim2=-1
+        )  # (..., m)
         ctx.save_for_backward(sptm, polarizations)
         return sptm, polarizations
 
@@ -83,7 +92,8 @@ class _BlockDiagonalizeCovariance(torch.autograd.Function):
         # <G_R, Omega R> = <G_R R^T, Omega>; only the antisymmetric part couples to Omega.
         rotation_grad = grad_sptm @ sptm.mT
         rotation_grad = 0.5 * (rotation_grad - rotation_grad.mT)
-        blocks = rotation_grad.reshape(*batch_shape, n_modes, 2, n_modes, 2).permute(
+        mode_grad = rotation_grad[..., : 2 * n_modes, : 2 * n_modes]
+        blocks = mode_grad.reshape(*batch_shape, n_modes, 2, n_modes, 2).permute(
             *range(len(batch_shape)), -4, -2, -3, -1
         )  # (..., m, m, 2, 2)
         # Decompose each 2x2 block on the orthogonal basis {I, J, K, L}.
@@ -117,6 +127,19 @@ class _BlockDiagonalizeCovariance(torch.autograd.Function):
         adjoint = adjoint_blocks.permute(*range(len(batch_shape)), -4, -2, -3, -1).reshape(
             *batch_shape, 2 * n_modes, 2 * n_modes
         )
+        if sptm.shape[-1] > 2 * n_modes:
+            # Odd size: the border couples every mode to the kernel vector, lambda_j J X_j = N_j.
+            border = rotation_grad[..., : 2 * n_modes, -1].reshape(*batch_shape, n_modes, 2)
+            inverse_polarizations = torch.where(
+                torch.abs(polarizations) > DEGENERACY_ATOL, 1.0 / polarizations, torch.zeros_like(polarizations)
+            )
+            adjoint_border = torch.stack([-border[..., 1], border[..., 0]], dim=-1) * inverse_polarizations[..., None]
+            adjoint_border = adjoint_border.reshape(*batch_shape, 2 * n_modes, 1)
+            corner = torch.zeros(*batch_shape, 1, 1, dtype=adjoint.dtype, device=adjoint.device)
+            adjoint = torch.cat(
+                [torch.cat([adjoint, adjoint_border], dim=-1), torch.cat([-adjoint_border.mT, corner], dim=-1)],
+                dim=-2,
+            )
         grad_covariance = sptm.mT @ adjoint @ sptm
         return 0.5 * (grad_covariance - grad_covariance.mT)
 
@@ -156,7 +179,7 @@ def block_diagonalize_covariance(covariance_matrix: TensorLike) -> Tuple[TensorL
     r"""
     Block-diagonalize a Majorana covariance matrix with a single-particle transition matrix.
 
-    Any real antisymmetric matrix :math:`\Lambda` of even size can be written as
+    Any real antisymmetric matrix :math:`\Lambda` of even size :math:`2m` can be written as
 
     .. math::
         \Lambda = R^\top \Lambda_D R,
@@ -176,9 +199,19 @@ def block_diagonalize_covariance(covariance_matrix: TensorLike) -> Tuple[TensorL
     ``covariance_matrix`` for any downstream quantity that only depends on :math:`\Lambda` through the
     reconstructed state, with the gradient along these gauge directions projected out.
 
-    :param covariance_matrix: Real antisymmetric matrix of shape ``(..., 2m, 2m)``.
+    An extended covariance matrix, of odd size :math:`2m + 1`, is decomposed the same way,
+
+    .. math::
+        \tilde\Lambda = R^\top \big(\Lambda_D \oplus 0\big) R,
+        \qquad
+        R \in SO(2m + 1),
+
+    where the last row of :math:`R` is a kernel vector of :math:`\tilde\Lambda`. The :math:`\lambda_j` are then the
+    polarizations of the normal modes of the displaced Gaussian state described by :math:`\tilde\Lambda`.
+
+    :param covariance_matrix: Real antisymmetric matrix of shape ``(..., 2m, 2m)`` or ``(..., 2m+1, 2m+1)``.
     :type covariance_matrix: TensorLike
-    :return: The transition matrix ``R`` of shape ``(..., 2m, 2m)`` and the polarizations of shape
+    :return: The transition matrix ``R``, of the shape of the input, and the polarizations of shape
         ``(..., m)``, both in the backend of the input and in the real floating dtype of its precision
         (``float64`` for an integer input, the real counterpart for a complex input).
     :rtype: Tuple[TensorLike, TensorLike]

@@ -1,3 +1,4 @@
+import warnings
 from typing import Any
 
 import numpy as np
@@ -127,6 +128,75 @@ class TestMixedGaussianState:
         covariance_matrix: Any = device.covariance_matrix
         covariance = covariance_matrix[..., indices[:, None], indices[None, :]]
         return MixedGaussianState(covariance, source_wires=kept)
+
+    @staticmethod
+    def random_product_amplitudes(n_wires: int, rng: np.random.Generator) -> np.ndarray:
+        """Random normalized single-qubit amplitudes for every wire.
+
+        :param n_wires: Number of wires.
+        :type n_wires: int
+        :param rng: Random generator drawing the amplitudes.
+        :type rng: np.random.Generator
+        :return: Complex array of shape ``(n_wires, 2)``.
+        :rtype: np.ndarray
+        """
+        amplitudes = rng.normal(size=(n_wires, 2)) + 1j * rng.normal(size=(n_wires, 2))
+        return amplitudes / np.linalg.norm(amplitudes, axis=-1, keepdims=True)
+
+    @staticmethod
+    def dense_product_state(amplitudes, operations, n_wires: int) -> np.ndarray:
+        """Apply the dense unitary of a circuit to the tensor product of single-qubit states.
+
+        :param amplitudes: Single-qubit amplitudes of shape ``(n_wires, 2)``.
+        :type amplitudes: np.ndarray
+        :param operations: Operations of the circuit.
+        :type operations: List[Operation]
+        :param n_wires: Number of wires.
+        :type n_wires: int
+        :return: The state vector.
+        :rtype: np.ndarray
+        """
+        psi = np.ones(1, dtype=complex)
+        for qubit_amplitudes in np.asarray(amplitudes):
+            psi = np.kron(psi, qubit_amplitudes)
+        unitary = np.asarray(qml.matrix(qml.tape.QuantumScript(operations), wire_order=range(n_wires)))
+        return unitary @ psi
+
+    @staticmethod
+    def displaced_from_device(device: NonInteractingFermionicDevice, kept) -> MixedGaussianState:
+        """Displaced reduced state of the device on the wires ``kept``, relabeled from zero.
+
+        The covariance matrix and the displacement are read from the extended covariance matrix of the device, on
+        the Majorana indices of the kept wires and on its parity index.
+
+        :param device: A device whose circuit has been applied to a product state.
+        :type device: NonInteractingFermionicDevice
+        :param kept: Wires to keep.
+        :type kept: List[int]
+        :return: The reduced state.
+        :rtype: MixedGaussianState
+        """
+        indices = MixedGaussianState.majorana_indices(kept)
+        extended: Any = device.extended_covariance_matrix
+        covariance = extended[..., indices[:, None], indices[None, :]]
+        return MixedGaussianState(covariance, displacement=extended[..., indices, -1], source_wires=kept)
+
+    @pytest.fixture
+    def displaced_case(self):
+        """A 5-wire circuit on a random product state reduced to the wires ``[0, 1, 2]`` with its dense reference."""
+        rng = np.random.default_rng(TEST_SEED + 11)
+        n_wires = 5
+        amplitudes = self.random_product_amplitudes(n_wires, rng)
+        operations = self.brick_wall(range(n_wires), 2, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        state = self.displaced_from_device(device, [0, 1, 2])
+        psi = self.dense_product_state(amplitudes, operations, n_wires)
+        reduced_density = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [3, 4]))
+        follow_up = self.brick_wall(range(3), 1, rng)
+        unitary = self.dense_unitary(follow_up, 3)
+        evolved_density = unitary @ reduced_density @ unitary.conj().T
+        return state, reduced_density, follow_up, evolved_density
 
     @pytest.fixture
     def reduced_case(self):
@@ -711,4 +781,362 @@ class TestMixedGaussianState:
         )
         torch.testing.assert_close(
             gradient, reference_gradient, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    def test_init_rejects_displacement_of_wrong_shape(self):
+        with pytest.raises(ValueError, match="displacement must have shape"):
+            MixedGaussianState(np.zeros((4, 4)), displacement=np.zeros(3))
+        with pytest.raises(ValueError, match="displacement must have shape"):
+            MixedGaussianState(np.zeros((2, 4, 4)), displacement=np.zeros(4))
+
+    def test_zero_displacement_is_not_displaced(self):
+        covariance = block_diagonal_covariance(np.array([0.5, -0.2]))
+        state = MixedGaussianState(covariance, displacement=np.zeros(4))
+        reference = MixedGaussianState(covariance)
+        assert not state.is_displaced
+        assert not reference.is_displaced
+        assert state.parity_wire is None
+        assert state.ensemble_wires == state.wires
+        assert state.sptm.shape == (4, 4)
+        assert reference.displacement.shape == (4,)
+        np.testing.assert_allclose(reference.displacement, 0.0, atol=ATOL_MATRIX_COMPARISON)
+        observable = qml.PauliX(0)
+        assert state.ensemble_observable(observable) is observable
+        assert "is_displaced" not in repr(state)
+
+    def test_displaced_state_properties(self, displaced_case):
+        state, _, _, _ = displaced_case
+        assert state.is_displaced
+        assert state.parity_wire == -1
+        assert state.ensemble_wires.tolist() == [-1, 0, 1, 2]
+        assert repr(state).endswith("is_displaced=True)")
+        extended = np.asarray(state.extended_covariance_matrix)
+        assert extended.shape == (7, 7)
+        np.testing.assert_allclose(extended[:6, :6], state.covariance_matrix, atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(extended[:6, 6], state.displacement, atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(extended[6, :6], -np.asarray(state.displacement), atol=ATOL_MATRIX_COMPARISON)
+        sptm = np.asarray(state.sptm)
+        assert sptm.shape == (8, 8)
+        np.testing.assert_allclose(sptm @ sptm.T, np.eye(8), atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(np.linalg.det(sptm), 1.0, atol=ATOL_SCALAR_COMPARISON)
+        assert state.sptm_operation.wires.tolist() == [-1, 0, 1, 2]
+        np.testing.assert_allclose(np.sum(np.asarray(state.weights)), 1.0, atol=ATOL_SCALAR_COMPARISON)
+
+    def test_displaced_state_parity_wire_follows_the_first_wire(self):
+        covariance = block_diagonal_covariance(np.array([0.0, 1.0]))
+        state = MixedGaussianState(covariance, wires=[3, 4], displacement=np.array([0.6, 0.0, 0.0, 0.0]))
+        assert state.parity_wire == 2
+        assert state.ensemble_wires.tolist() == [2, 3, 4]
+        prep, sptm_operation = state.pure_state_operations(0)
+        assert prep.wires.tolist() == [2, 3, 4]
+        assert sptm_operation.wires.tolist() == [2, 3, 4]
+
+    def test_displaced_density_matrix_matches_qubit_partial_trace(self, displaced_case):
+        state, reduced_density, _, _ = displaced_case
+        np.testing.assert_allclose(
+            state.density_matrix(), reduced_density, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    def test_displaced_entropy_and_purity_match_dense(self, displaced_case):
+        state, reduced_density, _, _ = displaced_case
+        eigenvalues = np.linalg.eigvalsh(reduced_density)
+        eigenvalues = eigenvalues[eigenvalues > 1e-12]
+        np.testing.assert_allclose(
+            state.entropy(),
+            -np.sum(eigenvalues * np.log(eigenvalues)),
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            state.purity,
+            np.trace(reduced_density @ reduced_density).real,
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        assert not state.is_pure
+
+    def test_displaced_pure_product_state_is_pure(self):
+        amplitudes = self.random_product_amplitudes(3, np.random.default_rng(TEST_SEED))
+        device = NonInteractingFermionicDevice(wires=3)
+        device.apply([ProductState(amplitudes, wires=range(3))])
+        state = self.displaced_from_device(device, [0, 1, 2])
+        assert state.is_displaced
+        assert state.is_pure
+        assert state.num_pure_states == 1
+        np.testing.assert_allclose(state.entropy(), 0.0, atol=ATOL_SCALAR_COMPARISON)
+        np.testing.assert_allclose(state.purity, 1.0, atol=ATOL_SCALAR_COMPARISON)
+
+    @pytest.mark.parametrize("pauli_word", ["XII", "IYI", "ZIX", "XYX", "XXI", "ZZI", "YZX", "IZI"])
+    def test_displaced_pure_states_reproduce_expectation_values(self, displaced_case, pauli_word):
+        state, reduced_density, _, _ = displaced_case
+        observable = qml.pauli.string_to_pauli_word(pauli_word)
+        expected = np.trace(reduced_density @ qml.matrix(observable, wire_order=range(3))).real
+        device = NonInteractingFermionicDevice(wires=state.ensemble_wires)
+        total = 0.0
+        for weight, prep, sptm_operation in state.pure_states():
+            value = device.execute_generator(
+                [prep, sptm_operation],
+                observable=state.ensemble_observable(observable),
+                output_type="expval",
+                reset=True,
+            )
+            total += float(weight) * float(np.asarray(value))
+        np.testing.assert_allclose(total, expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON)
+        np.testing.assert_allclose(
+            state.expval(observable), expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+        )
+
+    def test_displaced_ensemble_observable_dresses_the_odd_words(self, displaced_case):
+        state, _, _, _ = displaced_case
+        even_word = qml.PauliX(0) @ qml.PauliY(2)
+        assert state.ensemble_observable(even_word) is even_word
+        odd_word = state.ensemble_observable(qml.PauliZ(0) @ qml.PauliY(1))
+        assert qml.pauli.pauli_word_to_string(odd_word, wire_map={-1: 0, 0: 1, 1: 2, 2: 3}) == "XZYI"
+        projector = qml.Projector(np.array([1, 0]), wires=[0, 2])
+        assert state.ensemble_observable(projector) is projector
+        hamiltonian = state.ensemble_observable(0.5 * qml.PauliX(1) + 2.0 * qml.PauliZ(2))
+        coefficients, words = hamiltonian.terms()
+        np.testing.assert_allclose(coefficients, [0.5, 2.0], atol=ATOL_SCALAR_COMPARISON)
+        assert [qml.pauli.pauli_word_to_string(word, wire_map={-1: 0, 0: 1, 1: 2, 2: 3}) for word in words] == [
+            "XIXI",
+            "IIIZ",
+        ]
+        batch = state.ensemble_observable(BatchHamiltonian([1.0, 3.0], [qml.PauliY(0), qml.PauliZ(1)]))
+        assert isinstance(batch, BatchHamiltonian)
+        assert -1 in batch.ops[0].wires.tolist()
+        assert -1 not in batch.ops[1].wires.tolist()
+
+    def test_displaced_ensemble_observable_rejects_non_pauli_observable(self, displaced_case):
+        state, _, follow_up, _ = displaced_case
+        hermitian = qml.Hermitian(np.eye(2), wires=[0])
+        with pytest.raises(NotImplementedError, match="pure-state decomposition of a displaced"):
+            state.ensemble_observable(hermitian)
+        with pytest.raises(NotImplementedError, match="pure-state decomposition of a displaced"):
+            state.execute(follow_up, hermitian, "expval", mode="parallel")
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_displaced_execute_expval_matches_dense(self, displaced_case, mode):
+        state, _, follow_up, evolved_density = displaced_case
+        observables = [
+            qml.PauliX(0),
+            qml.PauliY(2),
+            qml.PauliZ(0) @ qml.PauliX(1),
+            qml.PauliX(0) @ qml.PauliY(1) @ qml.PauliX(2),
+            qml.PauliX(0) @ qml.PauliY(1) + 0.5 * qml.PauliZ(2) + 0.3 * qml.PauliX(1) - 1.1 * qml.PauliY(0),
+        ]
+        for observable in observables:
+            expected = np.trace(evolved_density @ qml.matrix(observable, wire_order=range(3))).real
+            value = state.execute(follow_up, observable, "expval", mode=mode)
+            np.testing.assert_allclose(value, expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON)
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_displaced_execute_batch_hamiltonian_and_projector_match_dense(self, displaced_case, mode):
+        state, _, follow_up, evolved_density = displaced_case
+        terms = [qml.PauliY(0), qml.PauliX(1) @ qml.PauliX(2), qml.PauliZ(0) @ qml.PauliX(2)]
+        coefficients = [0.2, -0.7, 1.3]
+        expected = [
+            coefficient * np.trace(evolved_density @ qml.matrix(term, wire_order=range(3))).real
+            for coefficient, term in zip(coefficients, terms)
+        ]
+        value = state.execute(follow_up, BatchHamiltonian(coefficients, terms), "expval", mode=mode)
+        np.testing.assert_allclose(value, expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON)
+        projector = qml.Projector(np.array([1, 0]), wires=[0, 2])
+        marginal = np.asarray(qml.math.partial_trace(evolved_density, [1]))
+        np.testing.assert_allclose(
+            state.execute(follow_up, projector, "expval", mode=mode),
+            np.diag(marginal).real[2],
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_displaced_execute_probs_and_samples_match_dense(self, displaced_case, mode):
+        state, _, follow_up, evolved_density = displaced_case
+        probabilities = state.execute(follow_up, output_type="probs", mode=mode)
+        np.testing.assert_allclose(
+            probabilities, np.diag(evolved_density).real, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        marginal = np.asarray(qml.math.partial_trace(evolved_density, [1]))
+        np.testing.assert_allclose(
+            state.execute(follow_up, output_type="probs", mode=mode, wires=[0, 2]),
+            np.diag(marginal).real,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+        np.random.seed(TEST_SEED)
+        samples = state.execute(follow_up, output_type="samples", mode=mode, shots=N_SHOTS)
+        assert samples.shape == (N_SHOTS, 3)
+        frequencies = np.bincount(samples @ (2 ** np.arange(3)[::-1]), minlength=8) / N_SHOTS
+        np.testing.assert_allclose(frequencies, np.diag(evolved_density).real, atol=ATOL_APPROX_COMPARISON)
+        estimated = state.execute(follow_up, output_type="probs", mode=mode, shots=N_SHOTS)
+        np.testing.assert_allclose(estimated, np.diag(evolved_density).real, atol=ATOL_APPROX_COMPARISON)
+
+    def test_displaced_evolve_and_chained_partial_trace_match_dense(self, displaced_case):
+        state, _, follow_up, evolved_density = displaced_case
+        evolved = state.evolve(follow_up)
+        assert evolved.is_displaced
+        np.testing.assert_allclose(
+            evolved.density_matrix(), evolved_density, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        np.testing.assert_allclose(
+            np.linalg.norm(evolved.displacement),
+            np.linalg.norm(state.displacement),
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            chained = evolved.partial_trace([2])
+        assert chained.wires.tolist() == [0, 1]
+        assert chained.source_wires.tolist() == [0, 1]
+        np.testing.assert_allclose(
+            chained.density_matrix(),
+            np.asarray(qml.math.partial_trace(evolved_density, [2])),
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+
+    def test_displaced_reduced_state_warns_when_front_wires_are_traced(self, displaced_case):
+        state, reduced_density, _, _ = displaced_case
+        with pytest.warns(UserWarning, match="fermionic partial trace"):
+            reduced = state.partial_trace([0])
+        assert reduced.source_wires.tolist() == [1, 2]
+        qubit_reduced = np.asarray(qml.math.partial_trace(reduced_density, [0]))
+        np.testing.assert_allclose(
+            reduced.probs(), np.diag(qubit_reduced).real, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        even_word = qml.PauliX(0) @ qml.PauliY(1)
+        np.testing.assert_allclose(
+            reduced.expval(even_word),
+            np.trace(qubit_reduced @ qml.matrix(even_word, wire_order=range(2))).real,
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        # An odd word of the reduced state carries the Z of the traced-out wire in front of it.
+        dressed = qml.PauliZ(0) @ qml.PauliX(1)
+        np.testing.assert_allclose(
+            reduced.expval(qml.PauliX(0)),
+            np.trace(reduced_density @ qml.matrix(dressed, wire_order=range(3))).real,
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+
+    def test_displaced_single_wire_state(self):
+        amplitudes = np.array([[np.sqrt(0.3), np.sqrt(0.7) * np.exp(0.4j)], [np.sqrt(0.6), np.sqrt(0.4)]])
+        operations = [CompRxRx(np.array([0.3, -0.8]), wires=[0, 1])]
+        device = NonInteractingFermionicDevice(wires=2)
+        device.apply([ProductState(amplitudes, wires=[0, 1])] + operations)
+        state = self.displaced_from_device(device, [0])
+        psi = self.dense_product_state(amplitudes, operations, 2)
+        reduced_density = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [1]))
+        np.testing.assert_allclose(
+            state.density_matrix(), reduced_density, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        for observable in (qml.PauliX(0), qml.PauliY(0), qml.PauliZ(0)):
+            expected = np.trace(reduced_density @ qml.matrix(observable)).real
+            np.testing.assert_allclose(
+                state.expval(observable), expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+            )
+            np.testing.assert_allclose(
+                state.execute([], observable, "expval", mode="parallel"),
+                expected,
+                atol=ATOL_SCALAR_COMPARISON,
+                rtol=RTOL_SCALAR_COMPARISON,
+            )
+        with pytest.raises(ValueError, match="at least two wires"):
+            state.evolve([])
+
+    def test_displaced_batched_state_matches_dense_in_all_modes(self):
+        rng = np.random.default_rng(TEST_SEED + 3)
+        n_wires = 4
+        amplitudes = np.stack([self.random_product_amplitudes(n_wires, rng) for _ in range(3)])
+        operations = self.brick_wall(range(n_wires), 1, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        state = self.displaced_from_device(device, [0, 1])
+        assert state.batch_shape == (3,)
+        follow_up = self.brick_wall(range(2), 1, rng)
+        unitary = self.dense_unitary(follow_up, 2)
+        observable = qml.PauliX(0) @ qml.PauliZ(1) + 0.6 * qml.PauliY(1) - 0.2 * qml.PauliX(0) @ qml.PauliX(1)
+        values = {
+            mode: np.asarray(state.execute(follow_up, observable, "expval", mode=mode))
+            for mode in ("parallel", "sequential", "direct")
+        }
+        probabilities = np.asarray(state.execute(follow_up, output_type="probs", mode="parallel"))
+        for batch_index in range(3):
+            psi = self.dense_product_state(amplitudes[batch_index], operations, n_wires)
+            reduced = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [2, 3]))
+            np.testing.assert_allclose(
+                np.asarray(state.density_matrix())[batch_index],
+                reduced,
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+            evolved = unitary @ reduced @ unitary.conj().T
+            expected = np.trace(evolved @ qml.matrix(observable, wire_order=range(2))).real
+            for value in values.values():
+                np.testing.assert_allclose(
+                    value[batch_index], expected, atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+                )
+            np.testing.assert_allclose(probabilities[batch_index], np.diag(evolved).real, atol=ATOL_MATRIX_COMPARISON)
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_displaced_gradient_through_partial_trace_matches_dense(self, mode):
+        rng = np.random.default_rng(TEST_SEED)
+        n_wires = 4
+        angles = torch.tensor(rng.normal(size=(3, 2)), dtype=torch.float64, requires_grad=True)
+        tilts = torch.tensor(rng.uniform(0.3, 2.5, size=n_wires), dtype=torch.float64, requires_grad=True)
+        phases = torch.tensor(rng.normal(size=n_wires), dtype=torch.complex128)
+
+        def amplitudes_of(tilt_angles):
+            return torch.stack(
+                [torch.cos(tilt_angles / 2) + 0j, torch.sin(tilt_angles / 2) * torch.exp(1j * phases)], dim=-1
+            )
+
+        def build(parameters):
+            return [
+                CompRxRx(parameters[0], wires=[0, 1]),
+                CompRyRy(parameters[1], wires=[1, 2]),
+                CompRxRx(parameters[2], wires=[2, 3]),
+                fSWAP(wires=[1, 2]),
+            ]
+
+        follow_up = self.brick_wall(range(2), 1, rng)
+        observable = qml.PauliX(0) + 0.7 * qml.PauliY(0) @ qml.PauliZ(1) + 0.4 * qml.PauliX(0) @ qml.PauliX(1)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes_of(tilts), wires=range(n_wires))] + build(angles))
+        value = self.displaced_from_device(device, [0, 1]).execute(follow_up, observable, "expval", mode=mode)
+        gradient_angles, gradient_tilts = torch.autograd.grad(value, (angles, tilts))
+
+        qubit_device = qml.device("default.qubit", wires=n_wires)
+
+        @qml.qnode(qubit_device, interface="torch")
+        def dense_circuit(parameters, initial_state):
+            qml.StatePrep(initial_state, wires=range(n_wires))
+            with qml.QueuingManager.stop_recording():
+                operations = build(parameters)
+            for operation in operations:
+                qml.apply(operation)
+            return qml.state()
+
+        reference_angles = angles.detach().clone().requires_grad_()
+        reference_tilts = tilts.detach().clone().requires_grad_()
+        reference_amplitudes = amplitudes_of(reference_tilts)
+        initial_state = reference_amplitudes[0]
+        for wire in range(1, n_wires):
+            initial_state = torch.kron(initial_state, reference_amplitudes[wire])
+        psi = dense_circuit(reference_angles, initial_state)
+        reduced = qml.math.partial_trace(torch.outer(psi, psi.conj()), [2, 3])
+        unitary = torch.tensor(self.dense_unitary(follow_up, 2))
+        evolved = unitary @ reduced @ unitary.conj().T
+        reference = torch.trace(evolved @ torch.tensor(qml.matrix(observable, wire_order=range(2)))).real
+        reference_gradients = torch.autograd.grad(reference, (reference_angles, reference_tilts))
+        torch.testing.assert_close(
+            value.detach(), reference.detach(), atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+        )
+        torch.testing.assert_close(
+            gradient_angles, reference_gradients[0], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        torch.testing.assert_close(
+            gradient_tilts, reference_gradients[1], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
         )

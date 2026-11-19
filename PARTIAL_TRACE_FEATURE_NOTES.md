@@ -35,6 +35,9 @@ it checked out.
     `"samples"`, analytic or with `shots`.
   - `evolve(operations)`, `partial_trace(wires)`, `reduced_state(wires)`: covariance-level
     evolution and nested reductions (chaining trace → circuit → trace).
+  - `displacement`, `is_displaced`, `parity_wire`, `ensemble_wires`,
+    `ensemble_observable(observable)`: displaced states, from circuits that start in a product
+    state with superposed qubits (see the design decisions).
   - `expval(observable)`, `probs(wires=None)`, `sample(shots)`, `entropy(base=None)`,
     `purity`, `is_pure`, `density_matrix()` (Wick expansion, small systems only),
     `extended_covariance_matrix`, `from_polarizations(...)` (class method).
@@ -62,10 +65,35 @@ probs = mixed.execute(follow_up_ops, output_type="probs", mode="direct")
   numerically against `qml.math.partial_trace`). For non-contiguous kept wires it differs by a
   `Z` on every traced-out wire between two `X`/`Y` factors of a Pauli word; the qubit version is
   not a Gaussian state and cannot be represented this way. The docs state this explicitly.
-- **Computational-basis initial states only.** A product state with superposed qubits carries a
-  displacement vector; its reduced state is Gaussian only in the extended Majorana algebra of the
-  whole system, not in the algebra of the kept wires. `reduced_state` raises
-  `NotImplementedError` for such states and `ValueError` for non-`ProductState` preparations.
+- **Product initial states, with a displacement when qubits are superposed (added 2026-11-18).**
+  A product state with superposed qubits carries a displacement vector d_μ = ⟨c_μ⟩, the last
+  column of the device's `extended_covariance_matrix`. Its reduced state is described by the
+  principal submatrix of the extended covariance matrix on the kept Majorana indices and the
+  parity index, that is by (Λ_A, d_A). `reduced_state` passes that displacement to
+  `MixedGaussianState(covariance, displacement=...)`; it still raises `ValueError` for
+  non-`ProductState` preparations. The earlier claim in these notes that the reduced state "is
+  not Gaussian in the algebra of the kept wires" was too strong: it is a displaced Gaussian state,
+  Gaussian for the 2m+1 operators (c_μ, parity), and everything is computed from the
+  (2m+1) x (2m+1) extended matrix.
+  - Qubit versus fermionic trace: an odd Majorana product keeps the Jordan-Wigner string from
+    wire 0, so with a displacement the reduction equals the qubit partial trace only when the
+    kept wires are a contiguous block starting at the first wire (trace out the last wires).
+    Otherwise odd Pauli words are dressed with Z on the traced-out wires in front; even words and
+    probabilities are unaffected. `MixedGaussianState.reduced_state` warns (`UserWarning`) in
+    that case. The exact qubit trace of a block that does not start at wire 0 is not a displaced
+    Gaussian state of this kind and is not implemented.
+  - Normal modes: `block_diagonalize_covariance` accepts odd sizes and returns R̃ ∈ SO(2m+1) with
+    Λ̃ = R̃ᵀ(Λ_D ⊕ 0)R̃ (kernel vector as last row), with the custom backward extended to the
+    mode/kernel border. Polarizations, entropy, purity and weights of a displaced state come
+    from this decomposition, not from the 2m x 2m block.
+  - Ensemble: the members of a displaced state live on m+1 wires, with a parity wire in front
+    (`parity_wire`, `ensemble_wires`). There R̃ ⊕ 1 is an ordinary SPTM (`sptm`,
+    `sptm_operation`), members are |0⟩|x⟩, even observables are measured as they are and odd
+    ones with an X on the parity wire (`ensemble_observable`). `execute` does this in the
+    parallel and sequential modes for `"expval"`. For `"probs"` and `"samples"` those modes run
+    the ensemble of the same state without displacement (`_without_displacement`), because
+    computational-basis statistics only depend on Λ; this also avoids the device's
+    position-versus-label sampling issue on wires that do not start at 0.
 - **Ensemble vs. direct evaluation.** The ensemble modes are what was asked for. The direct mode
   was added because the covariance matrix is linear in the state: it gives identical numbers,
   costs one execution instead of 2^r, and is the natural way to chain reductions.
@@ -115,8 +143,10 @@ probs = mixed.execute(follow_up_ops, output_type="probs", mode="direct")
   (`TestNonInteractingFermionicDevicePartialTrace`): contiguous traces vs
   `qml.math.partial_trace`, non-contiguous traces vs Jordan-Wigner-dressed expectations in the
   full system, follow-up circuit on non-contiguous wires vs the embedded free-fermion evolution,
-  QNode-then-trace, batched devices, error paths (unknown wires, empty kept set, superposed
-  product states, non-`ProductState` preparation).
+  QNode-then-trace, batched devices, error paths (unknown wires, empty kept set,
+  non-`ProductState` preparation), and superposed product states: traces of the last wires vs
+  `qml.math.partial_trace`, follow-up circuits in the three modes, traces of front wires
+  (warning, dressed odd words, undressed even words and probabilities), batches, dtypes.
 
 ## Verification (2026-09-24)
 
@@ -149,8 +179,10 @@ probs = mixed.execute(follow_up_ops, output_type="probs", mode="direct")
 
 ## Possible follow-ups (not done)
 
-- Support superposed product initial states (needs the extended, displaced Gaussian formalism on
-  the reduced system; research-level).
+- Exact qubit partial trace of a displaced state on a block of wires that does not start at the
+  first wire. A block ending at the last wire should be a displaced Gaussian state for the
+  reversed Jordan-Wigner order (parity wire behind instead of in front); a block in the middle
+  needs something else.
 - A qubit partial trace on non-contiguous wires is not Gaussian and would need a different
   representation.
 - Second-order treatment of exact degeneracies between mixed modes in the decomposition
