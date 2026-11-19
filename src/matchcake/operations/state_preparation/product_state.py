@@ -4,14 +4,14 @@ from typing import Optional
 import numpy as np
 import pennylane as qml
 import torch
-from pennylane.operation import StatePrepBase
 from pennylane.wires import Wires, WiresLike
 
 from ...typing import TensorLike
 from ...utils.torch_utils import infer_complex_dtype, infer_real_dtype, torch_dtype_name
+from .covariance_state_prep_base import CovarianceStatePrepBase
 
 
-class ProductState(StatePrepBase):
+class ProductState(CovarianceStatePrepBase):
     r"""
     Prepare a product state from per-qubit amplitudes.
 
@@ -243,6 +243,35 @@ class ProductState(StatePrepBase):
         # Antisymmetrise: Lambda <- Lambda - Lambda^T
         cov = cov - qml.math.einsum("...ij->...ji", cov)
         return cov
+
+    @cached_property
+    def displacement(self) -> TensorLike:
+        r"""
+        Displacement vector :math:`d_\mu = \langle\Psi|\, c_\mu\, |\Psi\rangle` of the prepared state.
+
+        Returns a real ``(2n,)`` tensor (or ``(B, 2n)`` for a batched state). With the per-qubit Bloch
+        vectors :math:`(x_k, y_k, z_k)`,
+
+        .. math::
+            d_{2k} = x_k \prod_{l < k} z_l, \qquad d_{2k+1} = y_k \prod_{l < k} z_l,
+
+        where the product is the expectation value of the Jordan-Wigner string. It vanishes for a
+        computational-basis state.
+        """
+        psi = self.data[0]
+        alpha = psi[..., 0]  # (..., n)
+        beta = psi[..., 1]  # (..., n)
+        r_dtype = infer_real_dtype(psi)
+        r_dtype_name = torch_dtype_name(r_dtype)
+        coherence = qml.math.conj(alpha) * beta
+        x = self._as_torch(qml.math.cast(2.0 * qml.math.real(coherence), dtype=r_dtype_name), dtype=r_dtype)
+        y = self._as_torch(qml.math.cast(2.0 * qml.math.imag(coherence), dtype=r_dtype_name), dtype=r_dtype)
+        z = self._as_torch(
+            qml.math.cast(qml.math.abs(alpha) ** 2 - qml.math.abs(beta) ** 2, dtype=r_dtype_name), dtype=r_dtype
+        )
+        ones = torch.ones_like(z[..., :1])
+        strings = torch.cat([ones, torch.cumprod(z[..., :-1], dim=-1)], dim=-1)  # prod_{l < k} z_l
+        return torch.stack([strings * x, strings * y], dim=-1).reshape(tuple(z.shape[:-1]) + (2 * z.shape[-1],))
 
     def as_basis_state(self) -> qml.BasisState:
         r"""

@@ -5,7 +5,7 @@ from pennylane.typing import TensorLike
 from pennylane.wires import Wires
 
 from ... import utils
-from ...operations.state_preparation.product_state import ProductState
+from ...operations.state_preparation.covariance_state_prep_base import CovarianceStatePrepBase
 from ...utils.math import convert_and_cast_like
 from .probability_strategy import ProbabilityStrategy
 
@@ -219,14 +219,18 @@ class ProductStateProbabilityStrategy(ProbabilityStrategy):
         return convert_and_cast_like(prob, covariance_matrix)
 
     def can_execute(self, state_prep_op: StatePrepBase) -> bool:
-        """Return True for any :class:`~matchcake.operations.ProductState` input.
+        """Return True for any state preparation that provides a covariance matrix.
+
+        This covers :class:`~matchcake.operations.state_preparation.ProductState` and
+        :class:`~matchcake.operations.state_preparation.GaussianStatePrep`: the probability formula only
+        involves the evolved covariance matrix, and it holds for mixed Gaussian states as well.
 
         :param state_prep_op: State preparation operation.
         :type state_prep_op: StatePrepBase
-        :return: True when ``state_prep_op`` is a ``ProductState``.
+        :return: True when ``state_prep_op`` is a ``CovarianceStatePrepBase``.
         :rtype: bool
         """
-        return isinstance(state_prep_op, ProductState)
+        return isinstance(state_prep_op, CovarianceStatePrepBase)
 
     def _compute_single(
         self,

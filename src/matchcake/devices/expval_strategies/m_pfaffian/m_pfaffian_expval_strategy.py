@@ -10,7 +10,7 @@ from pennylane import BasisState
 from pennylane.operation import Operator, StatePrepBase, TermsUndefinedError
 from pennylane.pauli import pauli_word_to_string
 
-from ....operations.state_preparation.product_state import ProductState
+from ....operations.state_preparation.covariance_state_prep_base import CovarianceStatePrepBase
 from ....typing import TensorLike
 from ....utils import JordanWigner
 from ....utils._pfaffian import infer_real_dtype, sector_pfaffian_features
@@ -316,10 +316,11 @@ class MPfaffianExpvalStrategy(ExpvalStrategy):
         """Return True iff this strategy can compute <observable>.
 
         Conditions:
-          1. state_prep_op is a BasisState or a ProductState.
+          1. state_prep_op is a BasisState or provides a covariance matrix and a displacement
+             (a ProductState or a GaussianStatePrep).
           2. observable decomposes into a sum of Pauli strings.
         """
-        if not isinstance(state_prep_op, (BasisState, ProductState)):
+        if not isinstance(state_prep_op, (BasisState, CovarianceStatePrepBase)):
             return False
         # Fast path: an observable already decomposed (and cached) is, by
         # construction, Pauli-decomposable.

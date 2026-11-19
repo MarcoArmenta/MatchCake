@@ -28,7 +28,12 @@ from ..operations.matchgate_operation import MatchgateOperation
 from ..operations.single_particle_transition_matrices.single_particle_transition_matrix import (
     SingleParticleTransitionMatrixOperation,
 )
-from ..operations.state_preparation import ProductState, StatePrepFromGates
+from ..operations.state_preparation import (
+    CovarianceStatePrepBase,
+    GaussianStatePrep,
+    ProductState,
+    StatePrepFromGates,
+)
 from ..typing import TensorLike
 from ..utils import (
     torch_utils,
@@ -44,9 +49,6 @@ from .expval_strategies.clifford_expval.clifford_expval_strategy import (
 )
 from .expval_strategies.expval_from_probabilities import ExpvalFromProbabilitiesStrategy
 from .expval_strategies.m_pfaffian import MPfaffianExpvalStrategy
-from .expval_strategies.m_pfaffian._extended_covariance import (
-    displacement_vector as _displacement_vector,
-)
 from .expval_strategies.m_pfaffian._extended_covariance import (
     extended_covariance_matrix as _extended_covariance_matrix,
 )
@@ -172,6 +174,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         "StatePrep",
         "BasisState",
         ProductState.__name__,
+        GaussianStatePrep.__name__,
     }
 
     DEFAULT_CONTRACTION_METHOD = "neighbours"
@@ -528,7 +531,8 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         A product state preparation (:class:`~pennylane.BasisState` or
         :class:`~matchcake.operations.state_preparation.ProductState`) is extended to the device wires in
         the device wire order, so it can act on part of the wires or list them in any order. The other
-        wires start in :math:`|0\rangle`.
+        wires start in :math:`|0\rangle`. A :class:`~matchcake.operations.state_preparation.GaussianStatePrep`
+        is extended the same way, with its wires in the order of the device.
 
         :param operation: The operation to apply
         :type operation: qml.operation.Operation
@@ -546,7 +550,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         is_applied = True
         if isinstance(operation, BasisState):
             operation = ProductState.from_basis_state(operation)
-        if isinstance(operation, ProductState) and self._wires is not None:
+        if isinstance(operation, CovarianceStatePrepBase) and self._wires is not None:
             self._state_prep_op = operation.to_wires(self.wires)
         elif isinstance(operation, StatePrepBase):
             self._state_prep_op = operation
@@ -868,7 +872,9 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         }
         if not rotated_bases:
             sampling_strategy = self.sampling_strategy
-            if isinstance(sampling_strategy, ProductBasisSampling) and not isinstance(self.state_prep_op, ProductState):
+            if isinstance(sampling_strategy, ProductBasisSampling) and not isinstance(
+                self.state_prep_op, CovarianceStatePrepBase
+            ):
                 sampling_strategy = self.fallback_sampling_strategy
             self._samples = sampling_strategy.batch_generate_samples(
                 self,
@@ -876,10 +882,10 @@ class NonInteractingFermionicDevice(qml.devices.Device):
                 show_progress=self.show_progress,
             )
         else:
-            if not isinstance(self.state_prep_op, ProductState):
+            if not isinstance(self.state_prep_op, CovarianceStatePrepBase):
                 raise DeviceError(
                     f"Sampling in a basis other than the computational basis on {self.name} requires a product "
-                    f"state or basis state preparation. Got {self.state_prep_op} instead."
+                    f"state, basis state or Gaussian state preparation. Got {self.state_prep_op} instead."
                 )
             self._samples = self.product_basis_sampling_strategy.batch_generate_samples(
                 self, bloch_vectors=bloch_vectors, show_progress=self.show_progress
@@ -962,7 +968,7 @@ class NonInteractingFermionicDevice(qml.devices.Device):
             show_progress=kwargs.pop("show_progress", self.show_progress),
             pfaffian_chunk_size=kwargs.pop("pfaffian_chunk_size", self.pfaffian_chunk_size),
         )
-        if isinstance(self.state_prep_op, ProductState):
+        if isinstance(self.state_prep_op, CovarianceStatePrepBase):
             strategy_kwargs["covariance_matrix"] = self.covariance_matrix
 
         return self.prob_dispatcher(
@@ -1581,10 +1587,10 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         :return: The covariance matrix, shape (..., 2n, 2n).
         :rtype: TensorLike
         """
-        if not isinstance(self.state_prep_op, ProductState):
+        if not isinstance(self.state_prep_op, CovarianceStatePrepBase):
             raise ValueError(
-                f"Covariance matrix can only be computed for product states. "
-                f"Got {type(self.state_prep_op)} instead of ProductState."
+                f"Covariance matrix can only be computed for a state preparation that provides one "
+                f"(a basis, product or Gaussian state). Got {type(self.state_prep_op)}."
             )
         cov0 = self.state_prep_op.covariance_matrix
         sptm = self.global_sptm.sptm_matrix(self.wires)
@@ -1598,22 +1604,24 @@ class NonInteractingFermionicDevice(qml.devices.Device):
         column/row at position 2n (the parity index). Evolves the full
         extended state under the matchgate SPTM as tilde_Q^T tilde_Lambda_0 tilde_Q.
 
-        BasisState inputs are promoted to ProductState first (displacement is zero).
+        BasisState inputs are promoted to ProductState first (displacement is zero). Any state preparation
+        that provides a covariance matrix and a displacement
+        (:class:`~matchcake.operations.state_preparation.CovarianceStatePrepBase`) is supported.
 
         See expval_from_mpf.md for the math.
         """
         state_prep = self.state_prep_op
         if isinstance(state_prep, BasisState):
             state_prep = ProductState.from_basis_state(state_prep)
-        if not isinstance(state_prep, ProductState):
+        if not isinstance(state_prep, CovarianceStatePrepBase):
             raise ValueError(
-                f"Extended covariance matrix requires a ProductState or BasisState. Got {type(state_prep)}."
+                f"Extended covariance matrix requires a state preparation that provides a covariance matrix "
+                f"(a basis, product or Gaussian state). Got {type(state_prep)}."
             )
         # Build tilde_Lambda_0 from the initial state. Cast to the device's configured
         # precision so r_dtype/c_dtype control the whole m-Pfaffian pipeline.
-        amplitudes = qml.math.cast(state_prep.data[0], self._c_dtype_name)  # (n, 2) complex
         cov0 = qml.math.cast(state_prep.covariance_matrix, self._r_dtype_name)  # (2n, 2n)
-        d0 = _displacement_vector(amplitudes, self.wires)  # (2n,)
+        d0 = qml.math.cast(state_prep.displacement, self._r_dtype_name)  # (2n,)
         ext_cov0 = _extended_covariance_matrix(cov0, d0)  # (2n+1, 2n+1)
 
         # Lift SPTM: \tilde{R} = R ⊕ 1
