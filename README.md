@@ -187,19 +187,29 @@ expval = nif_qnode(np.random.random(2), wires=nif_device.wires, initial_state=in
 print(f"Expectation value: {expval}")
 ```
 
-## Mixed States and Partial Trace
+## Mixed States, Partial Trace and Ancillas
 
-**Note:** this feature is on the `dev` branch of this fork while it is reviewed upstream (pull requests
-[#203](https://github.com/MatchCake/MatchCake/pull/203) and [#204](https://github.com/MatchCake/MatchCake/pull/204)).
-Install it with `pip install "git+https://github.com/MarcoArmenta/MatchCake@dev"`.
+**Only in this fork.** Everything in this section is on the `dev` branch of this fork and is not in upstream
+MatchCake. Install it with `pip install "git+https://github.com/MarcoArmenta/MatchCake@dev"`.
 
-A matchgate circuit keeps the state of the device fermionic Gaussian, so tracing out wires gives a state that is
-generally mixed but still Gaussian. `matchcake.states.MixedGaussianState` stores such a state as the covariance
-matrix of its wires (2m x 2m for m wires). Entropies, expectation values, probabilities and samples are computed
-from that matrix, without building the density matrix. When the circuit starts from a product state with
-superposed qubits, the state also carries a displacement vector (2m numbers).
+Upstream MatchCake starts a circuit from a basis state or a product state and measures it at the end. This fork
+adds what is needed to work with a part of the system, and to feed it back into another circuit:
 
-### Tracing out wires of a circuit
+| What you want to do | How |
+| :--- | :--- |
+| Start a circuit from any Gaussian state, pure or mixed | `GaussianStatePrep(covariance, wires=...)` |
+| Trace out wires after a circuit | `device.partial_trace(wires)`, `device.reduced_state(wires)` |
+| Read a reduced state: entropy, purity, normal modes | `MixedGaussianState` |
+| Run another circuit on a reduced state | `state.state_prep()` in the next circuit |
+| Trace out wires of a circuit that starts from a product state | same methods, the state is then *displaced* |
+| Add ancilla wires to a state | `state.insert(index, ancilla)`, `state.append(ancilla)` |
+
+A matchgate circuit keeps the state fermionic Gaussian, so a reduced state is fully described by the covariance
+matrix of its wires (2m x 2m numbers for m wires) and nothing here builds a density matrix. The tutorial below
+goes through these features one by one. The
+[theory page](https://github.com/MarcoArmenta/MatchCake/blob/dev/docs/partial_trace_theory.md) has the math.
+
+### 1. Trace out wires of a circuit
 
 After a circuit has been applied to the device, `partial_trace` takes the wires to remove and `reduced_state`
 the wires to keep. Both return a `MixedGaussianState` on the remaining wires, relabeled from 0.
@@ -208,6 +218,8 @@ the wires to keep. Both return a `MixedGaussianState` on the remaining wires, re
 import matchcake as mc
 import pennylane as qml
 import numpy as np
+import torch
+from matchcake.operations.state_preparation import GaussianStatePrep, ProductState
 
 nif_device = mc.NonInteractingFermionicDevice(wires=6)
 nif_device.apply([
@@ -220,94 +232,108 @@ nif_device.apply([
 ])
 
 # Trace out wires 4 and 5. The remaining wires are relabeled 0..3.
-mixed_state = nif_device.partial_trace([4, 5])
+reduced = nif_device.partial_trace([4, 5])
 # The same state, naming the wires to keep instead
-mixed_state = nif_device.reduced_state([0, 1, 2, 3])
+reduced = nif_device.reduced_state([0, 1, 2, 3])
 
-print(mixed_state.entropy())         # 0.2797, entanglement entropy between wires 0-3 and wires 4-5
-print(mixed_state.purity)            # 0.8522, Tr(rho^2), which is 1 for a pure state
-print(mixed_state.num_pure_states)   # 2
-print(mixed_state.weights)           # [0.0804, 0.9196]
-print(mixed_state.density_matrix())  # dense 16 x 16 matrix, for small systems only
+print(reduced.entropy())         # 0.2797, entanglement entropy between wires 0-3 and wires 4-5
+print(reduced.purity)            # 0.8522, Tr(rho^2), which is 1 for a pure state
+print(reduced.density_matrix())  # dense 16 x 16 matrix, for small systems only
 ```
 
-The reduced state is a mixture of a few pure Gaussian states that the device can prepare, at most 2^k of them
-for k traced-out wires. Their probabilities are in `weights`, and `pure_states()` iterates over them.
+`MixedGaussianState` is a container: it holds the state and gives what follows from its covariance matrix. It
+does not run circuits. That is the job of the device, as in the next step.
 
-### Running a circuit on a mixed state
+### 2. Run another circuit on the reduced state
 
-`execute` runs a follow-up circuit on the state and returns an expectation value, probabilities or samples.
-Continuing the example above:
+`state_prep()` returns the operation that prepares the state. Use it as the first operation of the next
+circuit, like `qml.BasisState`. Expectation values, probabilities, samples and shots then work as for any
+other circuit of the device.
 
 ```python
-follow_up = [mc.operations.CompRxRx(np.array([0.1, 0.2]), wires=[1, 2])]
 observable = qml.PauliZ(0) @ qml.PauliZ(1) + 0.5 * qml.PauliX(2) @ qml.PauliX(3)
 
-expval = mixed_state.execute(follow_up, observable, "expval", mode="direct")  # -1.3900
-probs = mixed_state.execute(follow_up, output_type="probs", mode="direct")  # 16 probabilities
-samples = mixed_state.execute(follow_up, output_type="samples", mode="direct", shots=1024)  # shape (1024, 4)
+@qml.qnode(qml.device("nif.qubit", wires=4))
+def follow_up():
+    reduced.state_prep()
+    mc.operations.CompRxRx(np.array([0.1, 0.2]), wires=[1, 2])
+    return qml.expval(observable), qml.probs(wires=[0, 1])
+
+expval, probs = follow_up()  # -1.3900, [0.0005, 0.1170, 0.8754, 0.0070]
+
+# The same circuit with a finite number of shots
+expval, probs = qml.set_shots(follow_up, shots=20_000)()  # about -1.39, about [0.001, 0.113, 0.878, 0.008]
 ```
 
-The `mode` argument selects how the circuit is run. The three modes return the same analytic values.
+### 3. Start a circuit from a Gaussian state
 
-- `"direct"` applies the circuit to the covariance matrix. It is a single execution, whatever the number of
-  pure states.
-- `"parallel"` (the default) runs the circuit on every pure state of the mixture in one batched execution of
-  the device, then recombines the outputs with the weights.
-- `"sequential"` does the same, one pure state at a time.
-
-### Building a mixed state directly
-
-A mixed state does not have to come from a circuit. `from_polarizations` builds a product of single-wire
-mixtures, and the constructor takes a covariance matrix directly.
+A mixed state does not have to come from a circuit. `GaussianStatePrep` prepares the state of a covariance
+matrix, and `MixedGaussianState.from_polarizations` builds simple ones: a product of single-wire mixtures.
 
 ```python
-import matchcake as mc
-import pennylane as qml
-import numpy as np
-from matchcake.states import MixedGaussianState
-
 # One polarization per wire: +1 is |0>, -1 is |1>, 0 is maximally mixed
-state = MixedGaussianState.from_polarizations(np.array([1.0, 0.0, -1.0, 0.5]))
+state = mc.MixedGaussianState.from_polarizations(np.array([1.0, 0.0, -1.0, 0.5]))
 print(state.entropy(), state.purity)  # 1.2555, 0.3125
 
-# Evolve the state with a matchgate circuit, then read it out
-evolved = state.evolve([
+@qml.qnode(qml.device("nif.qubit", wires=4))
+def circuit(covariance):
+    GaussianStatePrep(covariance, wires=range(4))
+    mc.operations.CompRxRx(np.array([0.3, 0.7]), wires=[0, 1])
+    mc.operations.CompRyRy(np.array([0.2, 1.1]), wires=[2, 3])
+    mc.operations.fSWAP(wires=[1, 2])
+    return qml.expval(qml.PauliZ(0)), qml.probs(wires=[0, 1])
+
+expval, probs = circuit(state.covariance_matrix)  # 0.8601, [0.1929, 0.7372, 0.0145, 0.0554]
+```
+
+The device keeps the state after a circuit, so a circuit and a trace can be chained without a QNode. A state
+prepared on part of the wires leaves the other wires in |0>.
+
+```python
+device = mc.NonInteractingFermionicDevice(wires=4)
+device.apply([
+    state.state_prep(),
     mc.operations.CompRxRx(np.array([0.3, 0.7]), wires=[0, 1]),
     mc.operations.CompRyRy(np.array([0.2, 1.1]), wires=[2, 3]),
     mc.operations.fSWAP(wires=[1, 2]),
 ])
-print(evolved.expval(qml.PauliZ(0)))  # 0.8601
-print(evolved.probs(wires=[0, 1]))    # [0.1929, 0.7372, 0.0145, 0.0554]
-print(evolved.sample(shots=5))        # 5 samples of the 4 wires
+print(device.partial_trace([3]).entropy())  # 1.2036
 
-# A mixed state can be traced again
-print(evolved.partial_trace([3]).entropy())  # 1.2036
-
-# The same state, from its covariance matrix
-same_state = MixedGaussianState(evolved.covariance_matrix)
+# The 4-wire state on wires 1-4 of a larger device, wires 0 and 5 in |0>
+larger_device = mc.NonInteractingFermionicDevice(wires=6)
+larger_device.apply([state.state_prep(wires=[1, 2, 3, 4])])
 ```
 
-### Tracing out an ancilla prepared in a product state
+### 4. Wires that are not next to each other
 
-The initial state can be any product state, for instance a system in a basis state next to an ancilla in a
-random product state. Put the wires to trace out last: keeping a block of wires that starts at the first wire
-gives the usual qubit partial trace.
+Keeping a contiguous block of wires, as above, gives the usual partial trace of the qubits. Keeping wires that
+leave gaps does not: the reduced state that stays Gaussian is the *fermionic* partial trace, and it has to be
+requested explicitly.
 
 ```python
-import matchcake as mc
-import pennylane as qml
-import numpy as np
-from matchcake.operations.state_preparation import ProductState
+nif_device.partial_trace([1, 3])  # ValueError: ... not a qubit partial trace ...
+separated = nif_device.partial_trace([1, 3], fermionic=True)
+print(separated.entropy())  # 0.9246
+```
 
+The fermionic partial trace is the usual partial trace of the state whose traced-out wires were first moved
+behind the kept ones with `fSWAP` gates. So "move the wires to the end with `fSWAP`, then discard them" is always
+exact.
+
+### 5. Trace out an ancilla prepared in a product state
+
+The circuit can start from any product state, for instance a system in a basis state next to an ancilla in a
+random product state. Put the wires to trace out last.
+
+```python
 rng = np.random.default_rng(0)
 # Wires 0-2 are the system, in |010>. Wires 3-4 are the ancilla, in a random product state.
 system = np.eye(2)[[0, 1, 0]]
 ancilla = rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2))
 ancilla /= np.linalg.norm(ancilla, axis=-1, keepdims=True)
 
-nif_device = mc.NonInteractingFermionicDevice(wires=5)
-nif_device.apply([
+ancilla_device = mc.NonInteractingFermionicDevice(wires=5)
+ancilla_device.apply([
     ProductState(np.concatenate([system, ancilla]), wires=range(5)),
     mc.operations.CompRxRx(np.array([0.3, 0.7]), wires=[2, 3]),
     mc.operations.CompRyRy(np.array([0.2, 1.1]), wires=[3, 4]),
@@ -315,57 +341,127 @@ nif_device.apply([
     mc.operations.CompRxRx(np.array([0.9, 0.4]), wires=[2, 3]),
 ])
 
-system_state = nif_device.partial_trace([3, 4])
-print(system_state.is_displaced)           # True
-print(system_state.entropy())              # 0.3598
-print(system_state.expval(qml.PauliX(2)))  # -0.1558
+system_state = ancilla_device.partial_trace([3, 4])
+print(system_state.is_displaced)  # True
+print(system_state.entropy())     # 0.3598
 
-follow_up = [mc.operations.CompRyRy(np.array([0.5, 0.6]), wires=[1, 2])]
-observable = qml.PauliX(2) + 0.5 * qml.PauliZ(0) @ qml.PauliZ(1)
-print(system_state.execute(follow_up, observable, "expval"))  # -0.5757
+@qml.qnode(qml.device("nif.qubit", wires=3))
+def system_circuit():
+    system_state.state_prep()
+    mc.operations.CompRyRy(np.array([0.5, 0.6]), wires=[1, 2])
+    return qml.expval(qml.PauliX(2) + 0.5 * qml.PauliZ(0) @ qml.PauliZ(1))
+
+print(system_circuit())  # -0.5757
 ```
 
-Such a state is called displaced: operators with an odd number of X and Y factors, like `qml.PauliX(2)` above,
-have a nonzero expectation value in it. Everything else works as for the other mixed states.
+Such a state is called *displaced*: operators with an odd number of X and Y factors, like `qml.PauliX(2)`, have
+a nonzero expectation value in it, and the state carries 2m more numbers, its `displacement`. Everything else
+works the same. For a displaced state, the kept block must start at the first wire for the trace to be the usual
+partial trace. Tracing out wires in front of it also needs `fermionic=True`.
 
-### Gradients
+### 6. Add ancilla wires to a state
 
-With PyTorch parameters, the reduced state and everything computed from it are differentiable.
+`insert` adds ancilla wires at a position of the wire list, as `list.insert` does, and `append` adds them behind
+the last wire. Both return a new state, the tensor product of the state with the ancilla.
 
 ```python
-import matchcake as mc
-import pennylane as qml
-import numpy as np
-import torch
+fresh = rng.normal(size=(1, 2)) + 1j * rng.normal(size=(1, 2))
+fresh /= np.linalg.norm(fresh, axis=-1, keepdims=True)
 
+in_front = system_state.insert(0, fresh)  # the ancilla is wire 0, the system is on wires 1-3
+between = system_state.insert(2, [1])     # an ancilla in |1> between the system wires 1 and 2
+behind = system_state.append([0, 0])      # two ancillas in |00> on wires 3-4
+print(in_front.num_wires, between.num_wires, behind.num_wires)  # 4 4 5
+
+# One more round: couple the fresh ancilla to the system, move it to the last wire, and discard it
+round_device = mc.NonInteractingFermionicDevice(wires=4)
+round_device.apply([
+    in_front.state_prep(),
+    mc.operations.CompRxRx(np.array([0.4, 0.2]), wires=[0, 1]),
+    mc.operations.fSWAP(wires=[0, 1]),
+    mc.operations.fSWAP(wires=[1, 2]),
+    mc.operations.fSWAP(wires=[2, 3]),
+])
+system_state = round_device.partial_trace([3])
+print(system_state.entropy())  # 0.6094
+```
+
+The ancilla is given as bits or a `qml.BasisState` for a computational-basis state, and as amplitudes of shape
+`(k, 2)` or a `ProductState` for any product state of `k` wires. Where it can go depends on its state.
+
+- An ancilla in a computational-basis state can be inserted at any position of any state.
+- An ancilla with superposed qubits can be inserted where the wires in front of it are in a pure state. This is
+  always the case at position 0. Behind wires in a mixed state, the tensor product is no longer a Gaussian state
+  and `insert` raises a `ValueError`. To bring such an ancilla next to a wire in the middle, insert it at
+  position 0 and move it with `fSWAP` gates, as in the example.
+
+### 7. Gradients
+
+With PyTorch parameters, the reduced state and everything computed from it are differentiable, including the
+entropy and a circuit that starts from the reduced state.
+
+```python
 params = torch.tensor([0.3, 0.7], dtype=torch.float64, requires_grad=True)
-nif_device = mc.NonInteractingFermionicDevice(wires=4)
-nif_device.apply([
+grad_device = mc.NonInteractingFermionicDevice(wires=4)
+grad_device.apply([
     qml.BasisState(np.array([1, 0, 1, 0]), wires=range(4)),
     mc.operations.CompRxRx(params, wires=[0, 1]),
     mc.operations.CompRyRy(params, wires=[1, 2]),
     mc.operations.CompRxRx(params, wires=[2, 3]),
 ])
+half = grad_device.partial_trace([2, 3])
 
 # Entanglement entropy between wires 0-1 and wires 2-3, and its gradient
-entropy = nif_device.partial_trace([2, 3]).entropy()
-entropy.backward()
+entropy = half.entropy()
+entropy.backward(retain_graph=True)
 print(entropy.item(), params.grad)  # 0.3389, [0.0370, 0.5396]
+
+# A circuit on the reduced state, differentiated through the covariance matrix
+@qml.qnode(qml.device("nif.qubit", wires=2), interface="torch", diff_method="backprop")
+def half_circuit(covariance):
+    GaussianStatePrep(covariance, wires=[0, 1])
+    mc.operations.CompRyRy(np.array([0.5, 0.6]), wires=[0, 1])
+    return qml.expval(qml.PauliZ(0))
+
+params.grad = None
+value = half_circuit(half.covariance_matrix)
+value.backward()
+print(value.item(), params.grad)  # -0.6365, [0.0009, 0.5192]
+```
+
+### 8. The pure states inside a mixed state
+
+A reduced state is a mixture of a few pure Gaussian states, at most 2^k of them for k traced-out wires.
+`weights` holds their probabilities and `pure_states()` iterates over them, each one as a basis state followed by
+a transition matrix that the device can prepare. This is a way to look inside the state or to cross-check a
+result. Running a circuit does not need it: the device evolves the covariance matrix in a single execution.
+
+```python
+print(reduced.num_pure_states, reduced.weights)  # 2, [0.0804, 0.9196]
+
+total = 0.0
+check_device = mc.NonInteractingFermionicDevice(wires=reduced.ensemble_wires)
+for weight, basis_state, transition in reduced.pure_states():
+    value = check_device.execute_generator(
+        [basis_state, transition, mc.operations.CompRxRx(np.array([0.1, 0.2]), wires=[1, 2])],
+        observable=reduced.ensemble_observable(observable),
+        output_type="expval",
+        reset=True,
+    )
+    total += float(weight) * float(value)
+print(total)  # -1.3900, the value of step 2
 ```
 
 ### Limits
 
-- The device must start from a product state: a computational-basis state (`qml.BasisState`) or a
-  `ProductState`.
-- The trace is the fermionic partial trace. It is the usual qubit partial trace when the kept wires form a
-  contiguous block, such as wires 0 to 3 above. It is not when they leave gaps, such as wires 0 and 2.
-- When the initial state has superposed qubits, the kept block must also start at the first wire for the trace
-  to be the qubit partial trace. `partial_trace` warns when a wire in front of the kept wires is traced out.
-- With a finite number of `shots`, expectation values are estimated from computational-basis samples, so they
-  are only meaningful for observables that are diagonal in that basis.
-
-See the [theory page](https://github.com/MarcoArmenta/MatchCake/blob/dev/docs/partial_trace_theory.md) for the
-details.
+- The first circuit must start from a state with a covariance matrix: a basis state, a `ProductState` or a
+  `GaussianStatePrep`.
+- The usual partial trace of the qubits needs the kept wires to be a contiguous block, which must start at the
+  first wire when the state is displaced. Every other case is the fermionic partial trace and needs
+  `fermionic=True`.
+- An ancilla with superposed qubits can only be added behind wires that are in a pure state.
+- A covariance matrix that is not the one of a state is rejected when its normal modes are computed: no mode can
+  have a polarization larger than one.
 
 ## Data Classification with MatchCake
 

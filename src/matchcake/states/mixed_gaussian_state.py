@@ -1,41 +1,34 @@
 import itertools
-import warnings
+import operator
 from functools import cached_property, reduce
-from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, cast
+from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pennylane as qml
 import torch
-from pennylane.measurements import ExpectationMP, ProbabilityMP
-from pennylane.operation import Operation, Operator, StatePrepBase, TermsUndefinedError
+from pennylane.operation import Operation, Operator, TermsUndefinedError
 from pennylane.ops.qubit.observables import BasisStateProjector
 from pennylane.pauli import pauli_word_to_string
 from pennylane.wires import Wires, WiresLike
 
-from ..devices.expval_strategies.m_pfaffian import MPfaffianExpvalStrategy
 from ..devices.expval_strategies.m_pfaffian._extended_covariance import extended_covariance_matrix, sptm_lift
-from ..devices.nif_device import NonInteractingFermionicDevice
-from ..devices.probability_strategies import ProductStateProbabilityStrategy
-from ..devices.sampling_strategies import ProductBasisSampling, get_sampling_strategy
 from ..observables.batch_hamiltonian import BatchHamiltonian
 from ..operations.single_particle_transition_matrices.single_particle_transition_matrix import (
     SingleParticleTransitionMatrixOperation,
 )
+from ..operations.state_preparation.gaussian_state_prep import GaussianStatePrep
 from ..operations.state_preparation.product_state import ProductState
 from ..typing import TensorLike
 from ..utils._pfaffian import sector_pfaffian_features
 from ..utils.covariance import block_diagonal_covariance, block_diagonalize_covariance
 from ..utils.majorana import MajoranaGetter
-from ..utils.math import complex_dtype_name_like, convert_and_cast_like, convert_like_and_cast_to, random_index
-from ..utils.torch_utils import detach
-
-ExecutionMode = Literal["parallel", "sequential", "direct"]
-OutputType = Literal["expval", "probs", "samples"]
+from ..utils.math import complex_dtype_name_like, convert_and_cast_like, convert_like_and_cast_to
+from ..utils.torch_utils import detach, infer_real_dtype
 
 
 class MixedGaussianState:
     r"""
-    A fermionic Gaussian state, possibly mixed, described by its Majorana covariance matrix.
+    A fermionic Gaussian state, possibly mixed, held by its Majorana covariance matrix.
 
     The state lives on ``m`` wires and is fully characterized by the real antisymmetric matrix
     :math:`\Lambda_{\mu\nu} = i\,\mathrm{Tr}[\rho\, c_\mu c_\nu]` (:math:`\mu \neq \nu`) built from the
@@ -44,38 +37,41 @@ class MixedGaussianState:
     subset of its wires: its covariance matrix is the principal submatrix of the circuit's covariance matrix on
     the Majorana indices of the kept wires.
 
-    Block-diagonalizing the covariance matrix with :func:`~matchcake.utils.covariance.block_diagonalize_covariance`,
+    This class is a container. It holds the state, computes what follows from its normal modes
+    (polarizations, entropy, purity, pure-state decomposition), reduces it to fewer wires
+    (:meth:`reduced_state`, :meth:`partial_trace`) and extends it with ancilla wires (:meth:`insert`,
+    :meth:`append`). It does not run circuits: to evolve or measure the state, prepare it on a
+    :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` with :meth:`state_prep`, which returns
+    a :class:`~matchcake.operations.state_preparation.GaussianStatePrep`. Expectation values, probabilities,
+    samples and gradients then come from the device, inside or outside a QNode, and
+    :meth:`~matchcake.devices.nif_device.NonInteractingFermionicDevice.reduced_state` gives the evolved state
+    back as a :class:`MixedGaussianState`.
+
+    **Normal modes.** Block-diagonalizing the covariance matrix with
+    :func:`~matchcake.utils.covariance.block_diagonalize_covariance`,
 
     .. math::
         \Lambda = R^\top \Big(\bigoplus_{j} (-\lambda_j) \begin{pmatrix} 0 & 1 \\ -1 & 0 \end{pmatrix}\Big) R,
 
     exhibits the state as the product of single-mode mixtures
     :math:`\rho_j = \tfrac{1 + \lambda_j}{2} |0\rangle\langle 0| + \tfrac{1 - \lambda_j}{2} |1\rangle\langle 1|`
-    evolved by the Gaussian unitary :math:`V_R` whose single-particle transition matrix is :math:`R`. Expanding
-    the product over the computational basis gives the **pure-state decomposition**
+    evolved by the Gaussian unitary :math:`V_R` whose single-particle transition matrix is :math:`R`. The
+    polarizations :math:`\lambda_j \in [-1, 1]` give the entropy and the purity. Expanding the product over
+    the computational basis gives the **pure-state decomposition**
 
     .. math::
         \rho = \sum_{x} w_x\, V_R |x\rangle\langle x| V_R^\dagger,
         \qquad
         w_x = \prod_j \frac{1 + (-1)^{x_j} \lambda_j}{2},
 
-    where each member :math:`V_R|x\rangle` is a state the
-    :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` can prepare with a
+    where each member :math:`V_R|x\rangle` is a state the device can prepare with a
     :class:`~matchcake.operations.state_preparation.ProductState` followed by a
     :class:`~matchcake.operations.SingleParticleTransitionMatrixOperation`. Modes with :math:`|\lambda_j| = 1`
     are pure and contribute a single term, so the sum runs over :math:`2^{r}` members where :math:`r` is the
     number of mixed modes (at most the number of traced-out wires). The members and their weights are exposed
-    by :meth:`pure_states`, :attr:`basis_states` and :attr:`weights`, and :meth:`execute` runs a follow-up
-    circuit on every member, one at a time (``mode="sequential"``) or as one batched execution
-    (``mode="parallel"``), and recombines the results with the weights.
-
-    Because the covariance matrix is linear in the state, the same follow-up circuit can also be applied
-    to the mixed state directly, :math:`\Lambda \mapsto R_2^\top \Lambda R_2` (:meth:`evolve`), and Pauli
-    expectation values, probabilities and samples can be read from the evolved covariance matrix with the
-    same Pfaffian formulas as for pure states (:meth:`expval`, :meth:`probs`, :meth:`sample`). This is what
-    ``mode="direct"`` of :meth:`execute` does. It gives the same numbers as the ensemble modes, costs a single
-    execution instead of :math:`2^r`, and its gradient is defined even when two mixed modes have exactly the
-    same polarization, a point where the pure-state decomposition is not differentiable.
+    by :meth:`pure_states`, :attr:`basis_states`, :attr:`weights` and :meth:`ensemble_operations`. They are a
+    way to analyze the state or to cross-check a result, not the way to run a circuit on it: the device
+    evolves the covariance matrix itself at the cost of a single execution.
 
     The covariance matrix may carry a leading batch dimension, ``(B, 2m, 2m)``, for instance when the
     circuit that produced it had batched parameters. The batch is carried through every property and method.
@@ -99,9 +95,10 @@ class MixedGaussianState:
     :attr:`ensemble_wires`), :math:`\tilde R \oplus 1` is an ordinary transition matrix, an operator with an
     even number of :math:`X` and :math:`Y` factors is measured as it is and an operator with an odd number of
     them is measured together with an :math:`X` on the parity wire (:meth:`ensemble_observable`).
-    :meth:`execute` does this bookkeeping in the ensemble modes, and the direct mode reads the same numbers
-    from :math:`\tilde\Lambda`. Probabilities and samples in the computational basis do not depend on the
-    displacement.
+
+    **Adding wires.** :meth:`insert` and :meth:`append` add ancilla wires in a product state at any position
+    of the wire list, as ``list.insert`` and ``list.append`` do, and return the tensor product as a new state.
+    They are the reverse of :meth:`partial_trace`.
 
     :param covariance_matrix: Real antisymmetric matrix of shape ``(2m, 2m)`` or ``(B, 2m, 2m)``.
     :type covariance_matrix: TensorLike
@@ -114,10 +111,6 @@ class MixedGaussianState:
     :param atol: A mode whose polarization satisfies :math:`|\lambda_j| \geq 1 - \text{atol}` is treated
         as pure and contributes a single member to the decomposition. Defaults to :attr:`DEFAULT_ATOL`.
     :type atol: float
-    :param device_kwargs: Keyword arguments (``r_dtype``, ``c_dtype``, ``pfaffian_chunk_size``, ...)
-        forwarded to every :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` this
-        state creates. Defaults to ``None`` (device defaults).
-    :type device_kwargs: Optional[Dict[str, Any]]
     :param source_wires: Labels, in the original system, of the wires this state was reduced to. Purely
         informative; defaults to ``wires``.
     :type source_wires: Optional[WiresLike]
@@ -126,6 +119,7 @@ class MixedGaussianState:
     DEFAULT_ATOL = 1e-8
     ANTISYMMETRY_ATOL = 1e-6
     DISPLACEMENT_ATOL = 1e-12
+    PHYSICALITY_ATOL = 1e-6
 
     @staticmethod
     def majorana_indices(wire_positions: Iterable[int]) -> np.ndarray:
@@ -153,6 +147,32 @@ class MixedGaussianState:
         safe = qml.math.where(positive, values, qml.math.ones_like(values))
         return qml.math.where(positive, values * qml.math.log(safe), qml.math.zeros_like(values))
 
+    @staticmethod
+    def _ancilla_product_state(ancilla: Any) -> ProductState:
+        """Return an ancilla given in any accepted form as a product state on ``range(k)``.
+
+        :param ancilla: A :class:`~matchcake.operations.state_preparation.ProductState`, a
+            :class:`~pennylane.BasisState`, one bit or a sequence of ``k`` bits, or amplitudes of shape
+            ``(k, 2)`` or ``(B, k, 2)``.
+        :type ancilla: Any
+        :return: The product state of the ``k`` ancilla wires.
+        :rtype: ProductState
+        :raises ValueError: If a scalar or one-dimensional ancilla is not made of the bits 0 and 1.
+        """
+        if isinstance(ancilla, qml.BasisState):
+            ancilla = ProductState.from_basis_state(ancilla)
+        if isinstance(ancilla, ProductState):
+            return ProductState(ancilla.data[0], wires=range(len(ancilla.wires)), validate_norm=False)
+        if qml.math.ndim(ancilla) <= 1:
+            bits = np.atleast_1d(np.asarray(ancilla))
+            if not np.all((bits == 0) | (bits == 1)):
+                raise ValueError(
+                    f"A scalar or one-dimensional ancilla is read as bits and must be made of 0 and 1, got "
+                    f"{bits.tolist()}. Pass the amplitudes of a product state with shape (k, 2) or (B, k, 2)."
+                )
+            return ProductState.from_basis_state(bits.astype(int), wires=range(len(bits)))
+        return ProductState(ancilla, wires=range(tuple(qml.math.shape(ancilla))[-2]))
+
     @classmethod
     def from_polarizations(
         cls,
@@ -178,7 +198,14 @@ class MixedGaussianState:
         :param kwargs: Forwarded to the constructor.
         :return: The state.
         :rtype: MixedGaussianState
+        :raises ValueError: If a polarization is outside of :math:`[-1, 1]`.
         """
+        largest = float(np.max(np.abs(np.asarray(detach(polarizations)))))
+        if largest > 1.0 + cls.PHYSICALITY_ATOL:
+            raise ValueError(
+                f"The polarizations of a state lie in [-1, 1], got one of magnitude {largest}: a mode cannot "
+                f"be more polarized than a pure mode."
+            )
         covariance = block_diagonal_covariance(polarizations)
         if sptm is not None:
             sptm = convert_and_cast_like(sptm, covariance)
@@ -192,7 +219,6 @@ class MixedGaussianState:
         *,
         displacement: Optional[TensorLike] = None,
         atol: float = DEFAULT_ATOL,
-        device_kwargs: Optional[Dict[str, Any]] = None,
         source_wires: Optional[WiresLike] = None,
     ):
         shape = tuple(qml.math.shape(covariance_matrix))
@@ -232,9 +258,6 @@ class MixedGaussianState:
         self._wires = wires
         self._source_wires = wires if source_wires is None else Wires(source_wires)
         self._atol = float(atol)
-        self.device_kwargs: Dict[str, Any] = dict(device_kwargs or {})
-        if "shots" in self.device_kwargs:
-            raise ValueError("device_kwargs cannot contain 'shots': pass the number of shots to execute or sample.")
 
     def __repr__(self) -> str:
         displaced = ", is_displaced=True" if self.is_displaced else ""
@@ -242,6 +265,22 @@ class MixedGaussianState:
             f"{type(self).__name__}(num_wires={self.num_wires}, batch_shape={self.batch_shape}, "
             f"num_mixed_modes={self.num_mixed_modes}, num_pure_states={self.num_pure_states}{displaced})"
         )
+
+    def append(self, ancilla: Any, *, wires: Optional[WiresLike] = None) -> "MixedGaussianState":
+        r"""
+        Add ancilla wires behind the wires of the state.
+
+        This is :meth:`insert` at the index :attr:`num_wires`, as ``list.append`` is ``list.insert`` at the end.
+
+        :param ancilla: The state of the new wires, see :meth:`insert`.
+        :type ancilla: Any
+        :param wires: Labels of the wires of the new state. Defaults to consecutive integers from the first
+            wire of this state.
+        :type wires: Optional[WiresLike]
+        :return: The state on the ``m + k`` wires.
+        :rtype: MixedGaussianState
+        """
+        return self.insert(self.num_wires, ancilla, wires=wires)
 
     def density_matrix(self) -> TensorLike:
         r"""
@@ -383,187 +422,152 @@ class MixedGaussianState:
             )
         return [product_state, SingleParticleTransitionMatrixOperation(sptm, wires=ensemble_wires)]
 
-    def evolve(self, operations: Iterable[Operation], **device_kwargs) -> "MixedGaussianState":
+    def insert(self, index: int, ancilla: Any, *, wires: Optional[WiresLike] = None) -> "MixedGaussianState":
         r"""
-        Apply a matchgate circuit to the state, at the level of the covariance matrix.
+        Add ancilla wires in a product state at a position of the wire list, as ``list.insert`` does.
 
-        The circuit is compiled to its single-particle transition matrix :math:`R_2` by a
-        :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` on the wires of the state, and
-        the covariance matrix is mapped to :math:`R_2^\top \Lambda R_2`. Since the map is linear in the
-        state, the result is exactly the mixture of the evolved members of :meth:`pure_states`. A
-        displacement is mapped to :math:`R_2^\top d`, since matchgates preserve the parity.
+        The new state is the tensor product of this state with the ancilla, on ``m + k`` wires: the ``k``
+        ancilla wires take the positions ``index, ..., index + k - 1`` and the wires of this state that were
+        at ``index`` or behind move back by ``k``. It is the reverse of :meth:`partial_trace`: tracing the
+        inserted wires out of the result of :meth:`append` gives this state back.
 
-        :param operations: Operations of the circuit, acting on the wires of the state. State preparations
-            are not allowed.
-        :type operations: Iterable[Operation]
-        :param device_kwargs: Overrides of the device keyword arguments of the state. The evolved state carries
-            them, so that its own readouts use the same settings.
-        :return: The evolved state, on the same wires.
+        The tensor product is the one of the qubits. In the Majorana operators of the ``m + k`` wires, the
+        operators of the ancilla carry the parity of the wires in front of it and the operators of the
+        wires behind it carry the parity of the ancilla, so the covariance matrix and the displacement of
+        the new state combine those of the two factors with the expectation values of these parities.
+
+        Not every tensor product is a Gaussian state, and the rule depends on the ancilla.
+
+        * An ancilla in a computational-basis state can be inserted at any index of any state.
+        * An ancilla with superposed qubits can be inserted where the wires in front of it are in a pure
+          state: at index 0 of any state, at any index of a product state, at the end of a pure state, and
+          behind a block of wires that is pure. Behind wires in a mixed state the tensor product is not a
+          Gaussian state, with or without displacement, and a ``ValueError`` is raised.
+
+        The state and the ancilla may each be batched, with the same batch size when both are.
+
+        :param index: Position of the first ancilla wire in the wire list of the new state, from ``0`` (in
+            front of every wire) to :attr:`num_wires` (behind every wire). A negative index counts from the
+            end, as for a list.
+        :type index: int
+        :param ancilla: The state of the new wires: a
+            :class:`~matchcake.operations.state_preparation.ProductState` or a :class:`~pennylane.BasisState`
+            (their wire labels are ignored), one bit or a sequence of ``k`` bits, or the amplitudes of a
+            product state with shape ``(k, 2)`` or ``(B, k, 2)``.
+        :type ancilla: Any
+        :param wires: Labels of the wires of the new state, which must be ``m + k`` consecutive integers.
+            Defaults to consecutive integers from the first wire of this state.
+        :type wires: Optional[WiresLike]
+        :return: The state on the ``m + k`` wires, with the settings of this state.
         :rtype: MixedGaussianState
+        :raises ValueError: If the index is out of range, or if the ancilla has superposed qubits and the
+            wires in front of it are not in a pure state.
         """
-        operations = self._check_operations(operations)
-        device = self._make_device(**device_kwargs)
-        device.apply(operations)
-        circuit_sptm = device.global_sptm.sptm_matrix(self.wires)
-        covariance = self.covariance_matrix
-        if isinstance(circuit_sptm, torch.Tensor):
-            covariance = convert_and_cast_like(covariance, circuit_sptm)
-        else:
-            circuit_sptm = convert_and_cast_like(circuit_sptm, covariance)
-        evolved = qml.math.einsum("...ij,...ik,...kl->...jl", circuit_sptm, covariance, circuit_sptm)
-        displacement = None
-        if self._displacement is not None:
-            displacement = qml.math.einsum(
-                "...ij,...i->...j", circuit_sptm, convert_and_cast_like(self._displacement, circuit_sptm)
-            )
-        return self._new(
-            evolved,
-            wires=self.wires,
-            source_wires=self.source_wires,
-            device_kwargs={**self.device_kwargs, **device_kwargs},
-            displacement=displacement,
-        )
-
-    def execute(
-        self,
-        operations: Iterable[Operation],
-        observable: Optional[Operator] = None,
-        output_type: Optional[OutputType] = None,
-        *,
-        mode: ExecutionMode = "parallel",
-        shots: Optional[int] = None,
-        device_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Optional[Any]:
-        r"""
-        Run a follow-up circuit on the state and return the requested output.
-
-        With ``mode="parallel"`` every member of the pure-state decomposition is prepared as one element of a
-        batched :class:`~matchcake.operations.state_preparation.ProductState`, the circuit is executed once
-        on a :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice` and the per-member outputs
-        are recombined with :attr:`weights`. With ``mode="sequential"`` the members are executed one after the
-        other. With ``mode="direct"`` the circuit is applied to the covariance matrix (:meth:`evolve`) and the
-        output is read from it without enumerating the members.
-
-        The parallel mode requires a circuit without a batch dimension of its own, because the batch axis
-        of the device is used for the members (and for the batch of the state, when it has one). A circuit
-        with batched parameters runs in the sequential or the direct mode.
-
-        Analytic outputs (``shots=None``) are exact. With a finite number of ``shots``, ``"samples"`` draws
-        the member of every shot from the weights and then a computational-basis sample from that member,
-        and ``"expval"`` and ``"probs"`` are estimated from such samples exactly like the device does. As with
-        the device, a sample-based expectation value is only meaningful for an observable that is diagonal
-        in the computational basis.
-
-        For a displaced state, the ensemble modes compute an expectation value on :attr:`ensemble_wires`, with
-        the observable mapped by :meth:`ensemble_observable`. Probabilities and samples do not depend on the
-        displacement, so the ensemble modes compute them from the pure-state decomposition of the same state
-        without its displacement.
-
-        :param operations: Operations of the follow-up circuit, acting on the wires of the state.
-        :type operations: Iterable[Operation]
-        :param observable: Observable for ``output_type="expval"``.
-        :type observable: Optional[Operator]
-        :param output_type: ``"expval"``, ``"probs"`` or ``"samples"``. Defaults to ``None`` (nothing is
-            computed and ``None`` is returned).
-        :type output_type: Optional[OutputType]
-        :param mode: ``"parallel"``, ``"sequential"`` or ``"direct"``. Defaults to ``"parallel"``.
-        :type mode: ExecutionMode
-        :param shots: Number of shots for sample-based outputs. Defaults to ``None`` (analytic).
-        :type shots: Optional[int]
-        :param device_kwargs: Overrides of the device keyword arguments of the state.
-        :type device_kwargs: Optional[Dict[str, Any]]
-        :param kwargs: Forwarded to :meth:`~matchcake.devices.nif_device.NonInteractingFermionicDevice.execute_output`,
-            for instance ``wires`` for ``output_type="probs"``.
-        :return: The recombined output. For ``"expval"`` and ``"probs"`` the leading dimensions are the batch
-            of the state (if any) followed by the batch of the circuit (sequential and direct modes only);
-            ``"samples"`` has shape ``(shots, *batch, m)``.
-        :rtype: Optional[Any]
-        """
-        if output_type is None:
-            return None
-        if output_type not in ("expval", "probs", "samples"):
+        num_wires = self.num_wires
+        position = operator.index(index)
+        if position < 0:
+            position += num_wires
+        if not 0 <= position <= num_wires:
             raise ValueError(
-                f"Output type {output_type!r} is not supported by {type(self).__name__}.execute. "
-                f"Supported output types are 'expval', 'probs' and 'samples'."
+                f"The index {index} is out of range for a {type(self).__name__} on {num_wires} wires: use an "
+                f"index between {-num_wires} and {num_wires}."
             )
-        if mode not in ("parallel", "sequential", "direct"):
-            raise ValueError(f"Unknown execution mode {mode!r}. Use 'parallel', 'sequential' or 'direct'.")
-        operations = self._check_operations(operations)
-        merged_device_kwargs = {**self.device_kwargs, **(device_kwargs or {})}
-        if "shots" in merged_device_kwargs:
-            raise ValueError("Pass the number of shots with the shots argument of execute, not through device_kwargs.")
-
-        if shots is not None and output_type != "samples":
-            samples = cast(
-                np.ndarray,
-                self.execute(
-                    operations, output_type="samples", mode=mode, shots=shots, device_kwargs=merged_device_kwargs
-                ),
-            )
-            return self._process_samples(samples, observable=observable, output_type=output_type, **kwargs)
-
-        if mode == "direct":
-            evolved = self.evolve(operations, **merged_device_kwargs)
-            if output_type == "expval":
-                return evolved.expval(observable)
-            if output_type == "probs":
-                return evolved.probs(wires=kwargs.get("wires", None))
-            return evolved.sample(shots)
-
-        if self.is_displaced and output_type != "expval":
-            return self._without_displacement().execute(
-                operations,
-                output_type=output_type,
-                mode=mode,
-                shots=shots,
-                device_kwargs=merged_device_kwargs,
-                **kwargs,
+        ancilla_state = self._ancilla_product_state(ancilla)
+        num_ancillas = len(ancilla_state.wires)
+        is_basis = bool(qml.math.all(ancilla_state.is_basis_state))
+        front_is_pure: Any = True
+        if not is_basis and position > 0:
+            front_is_pure = self.reduced_state(self.wires[:position]).is_pure
+        if not bool(np.all(front_is_pure)):
+            raise ValueError(
+                f"An ancilla with superposed qubits can only be inserted behind wires that are in a pure state. "
+                f"The {position} wires in front of index {index} are in a mixed state, so the tensor product "
+                f"is not a Gaussian state. Insert the ancilla at index 0, or use an ancilla in a "
+                f"computational-basis state, which can be inserted at any index."
             )
 
-        if mode == "parallel":
-            return self._execute_parallel(
-                operations, observable, output_type, shots=shots, device_kwargs=merged_device_kwargs, **kwargs
-            )
-        return self._execute_sequential(
-            operations, observable, output_type, shots=shots, device_kwargs=merged_device_kwargs, **kwargs
+        covariance_matrix = self.covariance_matrix
+        amplitudes = ancilla_state.data[0]
+        real_dtype = infer_real_dtype(covariance_matrix)
+        covariance = torch.as_tensor(covariance_matrix, dtype=real_dtype)  # (..., 2m, 2m)
+        displacement = torch.as_tensor(self.displacement, dtype=real_dtype, device=covariance.device)  # (..., 2m)
+
+        # Bloch vectors of the ancilla wires, and its Majorana data with the strings of its own wires.
+        ancilla_amplitudes = torch.as_tensor(amplitudes).to(covariance.device)  # (..., k, 2)
+        coherence = torch.conj(ancilla_amplitudes[..., 0]) * ancilla_amplitudes[..., 1]
+        bloch_x = (2.0 * torch.real(coherence)).to(real_dtype)
+        bloch_y = (2.0 * torch.imag(coherence)).to(real_dtype)
+        bloch_z = (torch.abs(ancilla_amplitudes[..., 0]) ** 2 - torch.abs(ancilla_amplitudes[..., 1]) ** 2).to(
+            real_dtype
         )
-
-    def expval(self, observable: Operator) -> TensorLike:
-        r"""
-        Analytic expectation value of an observable in the state.
-
-        Pauli observables (single words, sums, Hamiltonians) are evaluated with the m-Pfaffian strategy from
-        the extended covariance matrix, exactly as the device does for pure states. A
-        :class:`~pennylane.Projector` on a basis state is evaluated as a probability, and a
-        :class:`~matchcake.observables.BatchHamiltonian` term by term.
-
-        :param observable: The observable.
-        :type observable: Operator
-        :return: The expectation value, of shape ``()`` or ``(B,)`` (``(n_terms, ...)`` for a
-            ``BatchHamiltonian``).
-        :rtype: TensorLike
-        :raises NotImplementedError: If the observable is not supported.
-        """
-        if isinstance(observable, BatchHamiltonian):
-            return qml.math.stack(
-                [qml.math.real(coeff * self.expval(op)) for coeff, op in zip(observable.coeffs, observable.ops)]
-            )
-        if isinstance(observable, BasisStateProjector):
-            return self._states_probability(observable.parameters[0], observable.wires)
-        strategy = MPfaffianExpvalStrategy()
-        reference_prep = self._reference_state_prep()
-        if not strategy.can_execute(reference_prep, observable):
-            raise NotImplementedError(
-                f"The expectation value of {observable} cannot be computed from the covariance matrix of a "
-                f"{type(self).__name__}. Use a Pauli observable, a basis-state Projector or a BatchHamiltonian."
-            )
-        return strategy(
-            reference_prep,
-            observable,
-            extended_covariance_matrix=self.extended_covariance_matrix,
-            pfaffian_chunk_size=self.device_kwargs.get("pfaffian_chunk_size", None),
+        ones = torch.ones_like(bloch_z[..., :1])
+        strings_in_front = torch.cat([ones, torch.cumprod(bloch_z[..., :-1], dim=-1)], dim=-1)
+        reversed_z = torch.flip(bloch_z, dims=[-1])
+        strings_behind = torch.flip(torch.cat([ones, torch.cumprod(reversed_z[..., :-1], dim=-1)], dim=-1), dims=[-1])
+        ancilla_batch = tuple(bloch_z.shape[:-1])
+        ancilla_parity = torch.prod(bloch_z, dim=-1)  # <Z...Z> of the ancilla
+        # <b_nu> and i <b_nu P_B>, with b_nu the Majorana operators of the ancilla and P_B its parity.
+        ancilla_displacement = torch.stack([strings_in_front * bloch_x, strings_in_front * bloch_y], dim=-1).reshape(
+            ancilla_batch + (2 * num_ancillas,)
         )
+        ancilla_parity_displacement = torch.stack(
+            [strings_behind * bloch_y, -strings_behind * bloch_x], dim=-1
+        ).reshape(ancilla_batch + (2 * num_ancillas,))
+        ancilla_covariance = torch.as_tensor(ancilla_state.covariance_matrix).to(
+            dtype=real_dtype, device=covariance.device
+        )  # (..., 2k, 2k)
+
+        front_size = 2 * position
+        if is_basis or position == 0:
+            # No parity string of the wires in front is needed: the ancilla has no displacement, or it has
+            # no wire in front of it.
+            front_parity = torch.ones(self.batch_shape, dtype=real_dtype, device=covariance.device)
+            front_parity_displacement = covariance.new_zeros(self.batch_shape + (front_size,))
+            behind_displacement = displacement[..., front_size:]
+        else:
+            front_parity, front_parity_displacement, behind_displacement = self._parity_string_correlators(position)
+
+        batch_shape = torch.broadcast_shapes(self.batch_shape, ancilla_batch)
+        size = 2 * (num_wires + num_ancillas)
+        front = slice(0, front_size)
+        middle = slice(front_size, front_size + 2 * num_ancillas)
+        behind = slice(front_size + 2 * num_ancillas, size)
+        parity_factor = ancilla_parity[..., None, None]
+        joint = covariance.new_zeros(batch_shape + (size, size))
+        joint[..., front, front] = covariance[..., :front_size, :front_size]
+        joint[..., behind, behind] = covariance[..., front_size:, front_size:]
+        joint[..., front, behind] = parity_factor * covariance[..., :front_size, front_size:]
+        joint[..., behind, front] = parity_factor * covariance[..., front_size:, :front_size]
+        joint[..., middle, middle] = ancilla_covariance
+        front_block = front_parity_displacement[..., :, None] * ancilla_displacement[..., None, :]  # (..., 2i, 2k)
+        joint[..., front, middle] = front_block
+        joint[..., middle, front] = -front_block.mT
+        behind_block = ancilla_parity_displacement[..., :, None] * behind_displacement[..., None, :]
+        joint[..., middle, behind] = behind_block  # (..., 2k, 2(m - i))
+        joint[..., behind, middle] = -behind_block.mT
+
+        new_displacement: Optional[TensorLike] = None
+        if self._displacement is not None or not is_basis:
+            new_displacement = torch.cat(
+                [
+                    displacement[..., :front_size].expand(batch_shape + (front_size,)),
+                    (front_parity[..., None] * ancilla_displacement).expand(batch_shape + (2 * num_ancillas,)),
+                    (ancilla_parity[..., None] * displacement[..., front_size:]).expand(
+                        batch_shape + (2 * num_wires - front_size,)
+                    ),
+                ],
+                dim=-1,
+            )
+        is_tensor = isinstance(covariance_matrix, torch.Tensor) or isinstance(amplitudes, torch.Tensor)
+        new_covariance: TensorLike = joint
+        if not is_tensor:
+            new_covariance = convert_and_cast_like(joint, covariance_matrix)
+            if new_displacement is not None:
+                new_displacement = convert_and_cast_like(new_displacement, covariance_matrix)
+        if wires is None:
+            first_label = int(self.wires.tolist()[0])
+            wires = range(first_label, first_label + num_wires + num_ancillas)
+        return self._new(new_covariance, wires=wires, source_wires=None, displacement=new_displacement)
 
     def partial_trace(self, wires: WiresLike, **kwargs) -> "MixedGaussianState":
         r"""
@@ -584,26 +588,6 @@ class MixedGaussianState:
             raise ValueError(f"Wires {missing} are not wires of this state ({self.wires.tolist()}).")
         kept = [wire for wire in self.wires.tolist() if wire not in traced]
         return self.reduced_state(kept, **kwargs)
-
-    def probs(self, wires: Optional[WiresLike] = None) -> TensorLike:
-        r"""
-        Analytic probabilities of the computational-basis outcomes on the given wires.
-
-        Each probability is :math:`2^{-k} |\mathrm{Pf}(\Lambda|_W + \Lambda_y)|`, the overlap of the
-        Gaussian state with the basis state :math:`y` on the measured wires :math:`W`, as in
-        :class:`~matchcake.devices.probability_strategies.ProductStateProbabilityStrategy`.
-
-        :param wires: Measured wires, in the order of the returned outcomes. Defaults to all the wires.
-        :type wires: Optional[WiresLike]
-        :return: Probabilities of shape ``(2^k,)`` or ``(B, 2^k)``, with :math:`q_0` the most significant bit.
-        :rtype: TensorLike
-        """
-        wires = self.wires if wires is None else Wires(wires)
-        num_measured = len(wires)
-        outcomes = NonInteractingFermionicDevice.states_to_binary(np.arange(2**num_measured), num_measured)
-        probabilities = self._states_probability(outcomes, wires)  # (2^k, ...)
-        probabilities = qml.math.moveaxis(probabilities, 0, -1)
-        return probabilities / qml.math.sum(probabilities, axis=-1, keepdims=True)
 
     def pure_state_operations(self, index: int) -> List[Operation]:
         r"""
@@ -638,28 +622,39 @@ class MixedGaussianState:
             product_state, _ = self.pure_state_operations(index)
             yield weights[..., index], product_state, sptm_operation
 
-    def reduced_state(self, wires: WiresLike, *, reduced_wires: Optional[WiresLike] = None) -> "MixedGaussianState":
+    def reduced_state(
+        self, wires: WiresLike, *, reduced_wires: Optional[WiresLike] = None, fermionic: bool = False
+    ) -> "MixedGaussianState":
         r"""
         Keep the given wires and trace out the others.
 
         The kept wires are ordered as in the state, and the reduced state is relabeled on ``reduced_wires``
         (``range(k)`` by default). The reduced covariance matrix is the principal submatrix of the covariance
-        matrix on the Majorana indices of the kept wires, which is the fermionic partial trace: the Jordan-Wigner
-        strings of the reduced system run through the kept wires only. It coincides with the qubit partial trace
-        when the kept wires form a contiguous block.
+        matrix on the Majorana indices of the kept wires, and the displacement is restricted to the same
+        indices. This is the fermionic partial trace: the Jordan-Wigner strings of the reduced system run
+        through the kept wires only.
 
-        The displacement of a displaced state is restricted to the same indices. An operator with an odd
-        number of :math:`X` and :math:`Y` factors keeps its whole Jordan-Wigner string, which starts at the
-        first wire of the state, so for a displaced state the reduction coincides with the qubit partial trace
-        when the kept wires form a contiguous block that starts at the first wire. A warning is issued when a
-        wire in front of the kept wires is traced out of a displaced state.
+        The fermionic partial trace is the qubit partial trace when no string through a traced-out wire
+        survives: when the kept wires form a contiguous block and, for a displaced state, when that block
+        starts at the first wire (an operator with an odd number of :math:`X` and :math:`Y` factors keeps
+        its string from the first wire). In the other cases the two differ, and the reduction must be
+        requested explicitly with ``fermionic=True``. Its result is the qubit partial trace of the state
+        whose traced-out wires were first moved behind the kept ones with fSWAP gates, both groups keeping
+        their order. In the original state, a Pauli word of the reduced system corresponds to the same word
+        multiplied by a :math:`Z` on every traced-out wire that has an odd number of the :math:`X` and
+        :math:`Y` factors of the word behind it.
 
         :param wires: Wires to keep.
         :type wires: WiresLike
         :param reduced_wires: Labels of the wires of the reduced state. Defaults to ``range(k)``.
         :type reduced_wires: Optional[WiresLike]
+        :param fermionic: Whether to allow a reduction that differs from the qubit partial trace. Defaults to
+            ``False``.
+        :type fermionic: bool
         :return: The reduced state.
         :rtype: MixedGaussianState
+        :raises ValueError: If a wire is not a wire of the state, if no wire is kept, or if the reduction
+            differs from the qubit partial trace and ``fermionic`` is ``False``.
         """
         kept = Wires(wires)
         missing = [wire for wire in kept.tolist() if wire not in self.wires]
@@ -668,6 +663,19 @@ class MixedGaussianState:
         if len(kept) == 0:
             raise ValueError("At least one wire must be kept.")
         positions = sorted(self.wires.indices(kept))
+        is_contiguous = positions == list(range(positions[0], positions[0] + len(positions)))
+        if not fermionic and not (is_contiguous and (positions[0] == 0 or not self.is_displaced)):
+            reason = (
+                "the state has a displacement and wires in front of the kept block are traced out"
+                if is_contiguous
+                else "the kept wires are not a contiguous block"
+            )
+            raise ValueError(
+                f"Keeping the wires at positions {positions} of this {type(self).__name__} is not a qubit partial "
+                f"trace: {reason}. Pass fermionic=True to take the fermionic partial trace, which is the qubit "
+                f"partial trace of the state whose traced-out wires were first moved behind the kept wires with "
+                f"fSWAP gates."
+            )
         indices = self.majorana_indices(positions)
         covariance_matrix: Any = self.covariance_matrix
         covariance = covariance_matrix[..., indices[:, None], indices[None, :]]
@@ -676,70 +684,36 @@ class MixedGaussianState:
         if self._displacement is not None:
             displacement_vector: Any = self._displacement
             displacement = displacement_vector[..., indices]
-        if self.is_displaced and positions[0] != 0:
-            warnings.warn(
-                f"Wires in front of the kept wires are traced out of a displaced {type(self).__name__} (its "
-                f"circuit started from a product state with superposed qubits). The reduced state is the "
-                f"fermionic partial trace: its Pauli words with an odd number of X and Y factors correspond to "
-                f"the same words multiplied by a Z on every traced-out wire in front of them, and differ from "
-                f"the qubit partial trace. Words with an even number of X and Y factors and probabilities are "
-                f"not affected. Trace out the last wires of the register to obtain the qubit partial trace.",
-                UserWarning,
-                stacklevel=2,
-            )
         return self._new(covariance, wires=reduced_wires, source_wires=source_wires, displacement=displacement)
 
-    def sample(self, shots: Optional[int], sampling_strategy: Optional[str] = None, **device_kwargs) -> np.ndarray:
+    def state_prep(self, wires: Optional[WiresLike] = None) -> GaussianStatePrep:
         r"""
-        Draw computational-basis samples from the state.
+        Return the operation that prepares this state on a device.
 
-        The samples are generated wire block by wire block with the chain rule of probability, using the
-        sampling strategies of the device with the probabilities of :meth:`probs`. A
-        :class:`~matchcake.devices.sampling_strategies.ProductBasisSampling` strategy, the default of the
-        device, reads the state of a device instead of these probabilities, so the fallback strategy of the
-        device is used in its place.
+        The operation is the first operation of a circuit on a
+        :class:`~matchcake.devices.nif_device.NonInteractingFermionicDevice`, inside or outside a QNode. Called
+        inside a QNode, it is queued like any other operation:
 
-        :param shots: Number of samples.
-        :type shots: Optional[int]
-        :param sampling_strategy: Name of the sampling strategy. Defaults to the ``sampling_strategy`` of the
-            device keyword arguments, then to the device default.
-        :type sampling_strategy: Optional[str]
-        :param device_kwargs: Overrides of the device keyword arguments of the state.
-        :return: Integer samples of shape ``(shots, m)`` or ``(shots, B, m)``.
-        :rtype: np.ndarray
+        .. code-block:: python
+
+            @qml.qnode(qml.device("nif.qubit", wires=state.num_wires))
+            def circuit():
+                state.state_prep()
+                ...
+                return qml.expval(observable)
+
+        :param wires: The wires of the device that hold the state, in the order of the wires of the state.
+            Defaults to the wires of the state.
+        :type wires: Optional[WiresLike]
+        :return: The state preparation.
+        :rtype: GaussianStatePrep
         """
-        if shots is None:
-            raise ValueError("The number of shots must be specified to generate samples.")
-        device = self._make_device(shots=shots, **device_kwargs)
-        strategy = device.sampling_strategy if sampling_strategy is None else get_sampling_strategy(sampling_strategy)
-        if isinstance(strategy, ProductBasisSampling):
-            strategy = device.fallback_sampling_strategy
-        return np.asarray(
-            strategy.batch_generate_samples(device, self._states_probability_at_positions, show_progress=False)
-        ).astype(int)
-
-    def _check_operations(self, operations: Iterable[Operation]) -> List[Operation]:
-        """Materialize the operations and reject state preparations and foreign wires.
-
-        :param operations: The operations of a circuit.
-        :type operations: Iterable[Operation]
-        :return: The operations as a list.
-        :rtype: List[Operation]
-        """
-        operations = list(operations)
-        for operation in operations:
-            if isinstance(operation, StatePrepBase):
-                raise ValueError(
-                    f"The circuit run on a {type(self).__name__} cannot contain a state preparation, "
-                    f"got {operation}. The state itself is the initial state."
-                )
-            foreign = [wire for wire in operation.wires.tolist() if wire not in self.wires]
-            if foreign:
-                raise ValueError(
-                    f"Operation {operation} acts on wires {foreign} which are not wires of the state "
-                    f"({self.wires.tolist()})."
-                )
-        return operations
+        return GaussianStatePrep(
+            self.covariance_matrix,
+            self._displacement,
+            wires=self.wires if wires is None else wires,
+            validate=False,
+        )
 
     def _ensemble_basis_states(self) -> np.ndarray:
         """Basis states of the members of the pure-state decomposition, on :attr:`ensemble_wires`.
@@ -757,113 +731,11 @@ class MixedGaussianState:
         parity_bits = np.zeros(basis.shape[:-1] + (1,), dtype=int)
         return np.concatenate([parity_bits, basis], axis=-1)
 
-    def _execute_parallel(
-        self,
-        operations: List[Operation],
-        observable: Optional[Operator],
-        output_type: OutputType,
-        *,
-        shots: Optional[int],
-        device_kwargs: Dict[str, Any],
-        **kwargs,
-    ) -> Any:
-        """Run the circuit once on all the members at once and recombine the outputs.
-
-        :return: The recombined output.
-        :rtype: Any
-        """
-        device = self._make_device(ensemble=True, shots=shots, **device_kwargs)
-        result = device.execute_generator(
-            self.ensemble_operations() + operations,
-            observable=None if observable is None else self.ensemble_observable(observable),
-            output_type=output_type,
-            reset=True,
-            **kwargs,
-        )
-        num_members = self.num_pure_states
-        ensemble_shape = self.batch_shape + (num_members,)
-        if output_type == "samples":
-            samples = np.asarray(result)  # (shots, N, m)
-            samples = samples.reshape(samples.shape[:1] + ensemble_shape + samples.shape[-1:])
-            return self._select_members(samples)
-        weights = self.weights
-        if output_type == "probs":
-            result = qml.math.reshape(result, ensemble_shape + tuple(qml.math.shape(result))[1:])
-            weights = convert_and_cast_like(weights, result)
-            return qml.math.sum(weights[..., None] * result, axis=-2)
-        if isinstance(observable, BatchHamiltonian):
-            result = qml.math.reshape(result, tuple(qml.math.shape(result))[:1] + ensemble_shape)
-        else:
-            result = qml.math.reshape(result, ensemble_shape)
-        weights = convert_and_cast_like(weights, result)
-        return qml.math.sum(weights * result, axis=-1)
-
-    def _execute_sequential(
-        self,
-        operations: List[Operation],
-        observable: Optional[Operator],
-        output_type: OutputType,
-        *,
-        shots: Optional[int],
-        device_kwargs: Dict[str, Any],
-        **kwargs,
-    ) -> Any:
-        """Run the circuit on the members one after the other and recombine the outputs.
-
-        :return: The recombined output.
-        :rtype: Any
-        """
-        device = self._make_device(ensemble=True, shots=shots, **device_kwargs)
-        member_observable = None if observable is None else self.ensemble_observable(observable)
-        results = [
-            device.execute_generator(
-                self.pure_state_operations(index) + operations,
-                observable=member_observable,
-                output_type=output_type,
-                reset=True,
-                **kwargs,
-            )
-            for index in range(self.num_pure_states)
-        ]
-        if output_type == "samples":
-            samples = np.stack([np.asarray(sample) for sample in results], axis=-2)  # (shots, *batch, K, m)
-            return self._select_members(samples)
-        weights = convert_and_cast_like(self.weights, results[0])
-        total = None
-        for index, result in enumerate(results):
-            weight = weights[..., index]
-            if output_type == "probs":
-                weight = qml.math.reshape(weight, tuple(qml.math.shape(weight)) + (1,))
-            term = weight * result
-            total = term if total is None else total + term
-        return total
-
-    def _make_device(self, ensemble: bool = False, **device_kwargs) -> NonInteractingFermionicDevice:
-        """Create a device on the wires of the state.
-
-        :param ensemble: Whether to create the device on :attr:`ensemble_wires`, to run the members of the
-            pure-state decomposition, instead of the wires of the state. Defaults to ``False``.
-        :type ensemble: bool
-        :param device_kwargs: Overrides of the device keyword arguments of the state.
-        :return: The device.
-        :rtype: NonInteractingFermionicDevice
-        :raises ValueError: If the device would have a single wire, which it does not support.
-        """
-        wires = self.ensemble_wires if ensemble else self.wires
-        if len(wires) < 2:
-            raise ValueError(
-                f"A {type(self).__name__} on {self.num_wires} wire cannot create a NonInteractingFermionicDevice, "
-                f"which requires at least two wires: evolve, execute and sample are not available on it, while "
-                f"expval, probs, entropy and purity are."
-            )
-        return NonInteractingFermionicDevice(wires=wires, **{**self.device_kwargs, **device_kwargs})
-
     def _new(
         self,
         covariance_matrix: TensorLike,
         wires: Optional[WiresLike],
         source_wires: Optional[WiresLike],
-        device_kwargs: Optional[Dict[str, Any]] = None,
         displacement: Optional[TensorLike] = None,
     ) -> "MixedGaussianState":
         """Build a state sharing the settings of this one.
@@ -874,8 +746,6 @@ class MixedGaussianState:
         :type wires: Optional[WiresLike]
         :param source_wires: Source wires of the new state.
         :type source_wires: Optional[WiresLike]
-        :param device_kwargs: Device keyword arguments of the new state. Defaults to those of this state.
-        :type device_kwargs: Optional[Dict[str, Any]]
         :param displacement: Displacement vector of the new state. Defaults to ``None`` (no displacement).
         :type displacement: Optional[TensorLike]
         :return: The new state.
@@ -886,7 +756,6 @@ class MixedGaussianState:
             wires=wires,
             displacement=displacement,
             atol=self.atol,
-            device_kwargs=self.device_kwargs if device_kwargs is None else device_kwargs,
             source_wires=source_wires,
         )
 
@@ -913,110 +782,52 @@ class MixedGaussianState:
             return word
         return qml.prod(qml.PauliX(self.parity_wire), word)
 
-    def _process_samples(
-        self,
-        samples: np.ndarray,
-        *,
-        observable: Optional[Operator],
-        output_type: OutputType,
-        **kwargs,
-    ) -> TensorLike:
-        """Estimate an expectation value or probabilities from samples of the state.
+    def _parity_string_correlators(self, position: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""
+        Expectation values of the Majorana operators dressed with the parity of the first wires.
 
-        :param samples: Samples of shape ``(shots, m)`` or ``(shots, B, m)``.
-        :type samples: np.ndarray
-        :return: The estimate, with the batch of the state leading.
-        :rtype: TensorLike
+        With :math:`F` the Majorana indices of the ``position`` first wires and :math:`P` their parity, the
+        three results are :math:`\langle P \rangle`, the vector :math:`i \langle c_\mu P \rangle` for
+        :math:`\mu \in F` and the vector :math:`\langle P c_\mu \rangle` for the other indices. Since
+        :math:`P = (-i)^{|F|/2} \prod_{\nu \in F} c_\nu`, each of them is a product of Majorana operators and
+        is read from the extended covariance matrix with Wick's theorem, :math:`\infty` being its parity index:
+
+        .. math::
+            \langle P \rangle = (-1)^{|F|/2}\, \mathrm{Pf}(\Lambda|_F),
+            \qquad
+            i \langle c_\mu P \rangle
+            = (-1)^{|F|/2 + \mu + 1}\, \mathrm{Pf}(\tilde\Lambda|_{F \setminus \mu\, \cup\, \infty}),
+            \qquad
+            \langle P c_\mu \rangle = (-1)^{|F|/2}\, \mathrm{Pf}(\tilde\Lambda|_{F\, \cup\, \mu\, \cup\, \infty}) .
+
+        :meth:`insert` uses them for an ancilla with a displacement.
+
+        :param position: Number of wires in front, between ``1`` and :attr:`num_wires`.
+        :type position: int
+        :return: The parity, of shape ``(...)``, and the two vectors, of shapes ``(..., 2 * position)`` and
+            ``(..., 2 * (m - position))``.
+        :rtype: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         """
-        if output_type == "expval":
-            measurement: Any = ExpectationMP(obs=observable)
-        else:
-            measurement = ProbabilityMP(wires=Wires(kwargs.get("wires", None) or self.wires))
-        flat_samples = samples.reshape(samples.shape[0], -1, samples.shape[-1])  # (shots, prod(batch), m)
-        estimates = [
-            measurement.process_samples(
-                flat_samples[:, batch_index, :],
-                wire_order=self.wires,
-                shot_range=kwargs.get("shot_range", None),
-                bin_size=kwargs.get("bin_size", None),
-            )
-            for batch_index in range(flat_samples.shape[1])
-        ]
-        if len(self.batch_shape) == 0:
-            return estimates[0]
-        return qml.math.stack(estimates, axis=0)
-
-    def _reference_state_prep(self) -> ProductState:
-        """Return a basis-state preparation on the wires, used to route the strategies of the device.
-
-        :return: The preparation of the all-zero basis state.
-        :rtype: ProductState
-        """
-        return ProductState.from_basis_state(np.zeros(self.num_wires, dtype=int), wires=self.wires)
-
-    def _select_members(self, samples: np.ndarray) -> np.ndarray:
-        """Draw the member of every shot from the weights and keep that member's sample.
-
-        :param samples: Samples of every member, of shape ``(shots, *batch, K, m)``.
-        :type samples: np.ndarray
-        :return: Samples of the mixture, of shape ``(shots, *batch, m)``.
-        :rtype: np.ndarray
-        """
-        shots = samples.shape[0]
-        member_index = random_index(detach(self.weights), n=shots, axis=-1)  # (shots, *batch)
-        member_index = np.asarray(member_index, dtype=int).reshape(samples.shape[:-2])
-        selected = np.take_along_axis(samples, member_index[..., None, None], axis=-2)
-        return selected[..., 0, :]
-
-    def _states_probability(self, target_binary_states: TensorLike, wires: WiresLike) -> TensorLike:
-        """Probabilities of basis outcomes on the given wires, from the covariance matrix.
-
-        :param target_binary_states: Outcomes of shape ``(k,)`` or ``(n_outcomes, k)``.
-        :type target_binary_states: TensorLike
-        :param wires: Measured wires.
-        :type wires: WiresLike
-        :return: Probabilities of shape ``(...)`` or ``(n_outcomes, ...)``.
-        :rtype: TensorLike
-        """
-        strategy = ProductStateProbabilityStrategy()
-        return strategy(
-            state_prep_op=self._reference_state_prep(),
-            target_binary_states=np.asarray(target_binary_states, dtype=int),
-            wires=np.asarray(Wires(wires).tolist()),
-            covariance_matrix=self.covariance_matrix,
-            all_wires=self.wires,
-            pfaffian_chunk_size=self.device_kwargs.get("pfaffian_chunk_size", None),
+        num_majoranas = 2 * self.num_wires
+        front_size = 2 * position
+        extended = self.extended_covariance_matrix
+        real_dtype = infer_real_dtype(extended)
+        sign = (-1.0) ** position
+        front = np.arange(front_size)
+        front_parity = (
+            sign * torch.as_tensor(sector_pfaffian_features(extended, front[None, :]), dtype=real_dtype)[..., 0]
         )
-
-    def _states_probability_at_positions(
-        self, target_binary_states: TensorLike, wire_positions: WiresLike
-    ) -> TensorLike:
-        """Probabilities of basis outcomes on the wires at the given positions, for the sampling strategies.
-
-        The sampling strategies address wires by their position in the wire list of the device, not by their
-        label; this callback maps the positions to the labels of the state.
-
-        :param target_binary_states: Outcomes of shape ``(k,)`` or ``(n_outcomes, k)``.
-        :type target_binary_states: TensorLike
-        :param wire_positions: Positions of the measured wires in :attr:`wires`.
-        :type wire_positions: WiresLike
-        :return: Probabilities of shape ``(...)`` or ``(n_outcomes, ...)``.
-        :rtype: TensorLike
-        """
-        labels = [self.wires[int(position)] for position in Wires(wire_positions).tolist()]
-        return self._states_probability(target_binary_states, labels)
-
-    def _without_displacement(self) -> "MixedGaussianState":
-        """Return the state with the same covariance matrix and no displacement.
-
-        It is the average of the state and of its image under the fermion parity. Both have the same
-        expectation values of the operators with an even number of X and Y factors, hence the same
-        computational-basis probabilities, before and after any matchgate circuit.
-
-        :return: The state without its displacement.
-        :rtype: MixedGaussianState
-        """
-        return self._new(self.covariance_matrix, wires=self.wires, source_wires=self.source_wires)
+        without_one = np.stack([np.append(np.delete(front, mu), num_majoranas) for mu in range(front_size)])
+        alternating = torch.as_tensor(-sign * (-1.0) ** front, dtype=real_dtype)
+        front_terms = alternating * torch.as_tensor(sector_pfaffian_features(extended, without_one), dtype=real_dtype)
+        behind_shape = tuple(front_parity.shape) + (num_majoranas - front_size,)
+        behind_terms = front_parity.new_zeros(behind_shape)
+        if front_size < num_majoranas:
+            with_one = np.stack(
+                [np.concatenate([front, [mu, num_majoranas]]) for mu in range(front_size, num_majoranas)]
+            )
+            behind_terms = sign * torch.as_tensor(sector_pfaffian_features(extended, with_one), dtype=real_dtype)
+        return front_parity, front_terms, behind_terms
 
     def _mixed_combinations(self) -> np.ndarray:
         """Every assignment of the bits of the mixed modes, in lexicographic order.
@@ -1287,7 +1098,14 @@ class MixedGaussianState:
 
         :return: The transition matrix and the polarizations.
         :rtype: Tuple[TensorLike, TensorLike]
+        :raises ValueError: If a polarization exceeds one, which no state has.
         """
-        if self.is_displaced:
-            return block_diagonalize_covariance(self.extended_covariance_matrix)
-        return block_diagonalize_covariance(self.covariance_matrix)
+        matrix = self.extended_covariance_matrix if self.is_displaced else self.covariance_matrix
+        transition_matrix, polarizations = block_diagonalize_covariance(matrix)
+        largest = float(np.max(np.abs(np.asarray(detach(polarizations)))))
+        if largest > 1.0 + self.PHYSICALITY_ATOL:
+            raise ValueError(
+                f"The covariance matrix and the displacement do not describe a state: a normal mode has a "
+                f"polarization of magnitude {largest}, larger than one."
+            )
+        return transition_matrix, polarizations
