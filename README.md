@@ -328,6 +328,41 @@ print(system_state.execute(follow_up, observable, "expval"))  # -0.5757
 Such a state is called displaced: operators with an odd number of X and Y factors, like `qml.PauliX(2)` above,
 have a nonzero expectation value in it. Everything else works as for the other mixed states.
 
+### Adding ancilla wires to a state
+
+`insert` adds ancilla wires at a position of the wire list, as `list.insert` does, and `append` adds them behind
+the last wire. Both return a new state, the tensor product of the state with the ancilla. Continuing the example
+above:
+
+```python
+fresh = rng.normal(size=(1, 2)) + 1j * rng.normal(size=(1, 2))
+fresh /= np.linalg.norm(fresh, axis=-1, keepdims=True)
+
+in_front = system_state.insert(0, fresh)  # the ancilla is wire 0, the system is on wires 1-3
+between = system_state.insert(2, [1])     # an ancilla in |1> between the system wires 1 and 2
+behind = system_state.append([0, 0])      # two ancillas in |00> on wires 3-4
+print(in_front.num_wires, between.num_wires, behind.num_wires)  # 4 4 5
+
+# One more round: couple the fresh ancilla to the system, move it to the last wire, and discard it
+coupled = in_front.evolve([
+    mc.operations.CompRxRx(np.array([0.4, 0.2]), wires=[0, 1]),
+    mc.operations.fSWAP(wires=[0, 1]),
+    mc.operations.fSWAP(wires=[1, 2]),
+    mc.operations.fSWAP(wires=[2, 3]),
+])
+system_state = coupled.partial_trace([3])
+print(system_state.entropy())  # 0.6094
+```
+
+The ancilla is given as bits or a `qml.BasisState` for a computational-basis state, and as amplitudes of shape
+`(k, 2)` or a `ProductState` for any product state of `k` wires. Where it can go depends on its state.
+
+- An ancilla in a computational-basis state can be inserted at any position of any state.
+- An ancilla with superposed qubits can be inserted where the wires in front of it are in a pure state. This is
+  always the case at position 0. Behind wires in a mixed state, the tensor product is no longer a Gaussian state
+  and `insert` raises a `ValueError`. To bring such an ancilla next to a wire in the middle, insert it at
+  position 0 and move it with `fSWAP` gates, as in the example.
+
 ### Gradients
 
 With PyTorch parameters, the reduced state and everything computed from it are differentiable.
@@ -361,6 +396,9 @@ print(entropy.item(), params.grad)  # 0.3389, [0.0370, 0.5396]
   contiguous block, such as wires 0 to 3 above. It is not when they leave gaps, such as wires 0 and 2.
 - When the initial state has superposed qubits, the kept block must also start at the first wire for the trace
   to be the qubit partial trace. `partial_trace` warns when a wire in front of the kept wires is traced out.
+- In every case, the fermionic partial trace is the qubit partial trace of the state whose traced-out wires were
+  first moved behind the kept ones with `fSWAP` gates.
+- An ancilla with superposed qubits can only be added behind wires that are in a pure state.
 - With a finite number of `shots`, expectation values are estimated from computational-basis samples, so they
   are only meaningful for observables that are diagonal in that basis.
 

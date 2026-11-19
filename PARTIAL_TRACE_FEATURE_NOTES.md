@@ -38,6 +38,9 @@ it checked out.
   - `displacement`, `is_displaced`, `parity_wire`, `ensemble_wires`,
     `ensemble_observable(observable)`: displaced states, from circuits that start in a product
     state with superposed qubits (see the design decisions).
+  - `insert(index, ancilla, *, wires=None)`, `append(ancilla, *, wires=None)`: add ancilla wires
+    in a product state at a position of the wire list, like `list.insert` and `list.append`; the
+    reverse of `partial_trace` (see the design decisions).
   - `expval(observable)`, `probs(wires=None)`, `sample(shots)`, `entropy(base=None)`,
     `purity`, `is_pure`, `density_matrix()` (Wick expansion, small systems only),
     `extended_covariance_matrix`, `from_polarizations(...)` (class method).
@@ -94,6 +97,29 @@ probs = mixed.execute(follow_up_ops, output_type="probs", mode="direct")
     the ensemble of the same state without displacement (`_without_displacement`), because
     computational-basis statistics only depend on Λ; this also avoids the device's
     position-versus-label sampling issue on wires that do not start at 0.
+- **Adding ancilla wires: `insert` and `append` (added 2026-11-18).** The result is the qubit
+  tensor product ρ ⊗ σ with the k ancilla wires at positions index..index+k-1. With F the wires of
+  ρ in front of the ancilla B and G those behind it, the Majorana operators of the new register
+  are c_μ (F), P_F b_ν (B) and c_μ P_B (G), so the new covariance and displacement are products of
+  expectation values: Λ_FG is multiplied by ⟨P_B⟩, the F-B block is i⟨c_μ P_F⟩_ρ⟨b_ν⟩_σ, the B-G
+  block is i⟨b_ν P_B⟩_σ⟨P_F c_μ⟩_ρ, and d' = (d_F, ⟨P_F⟩ d_σ, ⟨P_B⟩ d_G). The ρ factors are Pauli
+  words (Z strings) evaluated with `expval` (`_parity_string_correlators`); the σ factors are
+  closed forms in the Bloch vectors.
+  - Exactness, verified against dense tensor products at every position: an ancilla in a
+    computational-basis state gives a Gaussian state anywhere. An ancilla with superposed qubits
+    gives one exactly when the wires in front of it are in a pure state (index 0 always, any
+    index of a product state, the end of a pure state, behind a pure block). Otherwise the
+    tensor product violates Wick's theorem (one wire with Bloch vector r in front of an ancilla
+    with Bloch vector s: ⟨C_0 C_1 C_2⟩ = i s_x, Wick gives i |r|² s_x) and `insert` raises
+    `ValueError`. This is a property of the states, not of the implementation.
+  - Consequence for repeated rounds with superposed ancillas: insertion wants the ancilla in
+    front, a qubit-exact trace wants it behind. Moving it across with fSWAP gates is exact and is
+    what the fermionic trace does anyway: the fermionic partial trace of any wires equals the
+    qubit partial trace after the traced-out wires are moved behind the kept ones with fSWAPs
+    (verified numerically, with and without displacement).
+  - Upstream has no equivalent (checked 2026-11-18 on every upstream branch, issue and pull
+    request): "ancilla" only appears there as an internal construction, in `ProductBasisSampling`
+    and in the lifted covariance of the `swap_injection`, `magic` and `mc_compat_port` branches.
 - **Ensemble vs. direct evaluation.** The ensemble modes are what was asked for. The direct mode
   was added because the covariance matrix is linear in the state: it gives identical numbers,
   costs one execution instead of 2^r, and is the natural way to chain reductions.
@@ -138,7 +164,9 @@ probs = mixed.execute(follow_up_ops, output_type="probs", mode="direct")
   entropy/purity vs dense, all three `execute` modes vs dense for `expval` (Pauli sums,
   `BatchHamiltonian`, `Projector`), `probs` (full and marginal), `samples` (frequencies),
   finite-shot estimates, batched states and batched follow-up circuits, `evolve` and chaining,
-  gradient vs dense torch reference in all three modes.
+  gradient vs dense torch reference in all three modes, displaced states (same list, plus the
+  parity wire and `ensemble_observable`), and `insert`/`append` vs dense tensor products (every
+  position, basis and superposed ancillas, rejected positions, batches, backends, gradient).
 - `tests/test_devices/test_nif_device/test_nif_device_partial_trace.py`
   (`TestNonInteractingFermionicDevicePartialTrace`): contiguous traces vs
   `qml.math.partial_trace`, non-contiguous traces vs Jordan-Wigner-dressed expectations in the

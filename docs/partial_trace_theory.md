@@ -7,8 +7,8 @@ circuit is run on it. It builds on the covariance-matrix formalism of
 the state of the device is a computational-basis state $`|x\rangle`$ evolved by the
 matchgate circuit $`V`$, and it is fully described by its Majorana covariance matrix
 $`\Lambda = R^\top \Lambda_0 R`$, with $`R`$ the single-particle transition matrix of $`V`$.
-Sections 1 to 4 treat this case, and Section 5 extends it to a product state with superposed
-qubits as the initial state.
+Sections 1 to 4 treat this case, Section 5 extends it to a product state with superposed
+qubits as the initial state, and Section 6 adds ancilla wires to a state.
 
 ## 1. The reduced state is Gaussian
 
@@ -41,7 +41,11 @@ factors, which is the fermionic (mode) partial trace. When $`A`$ is a contiguous
 no traced-out wire lies between two kept wires, and the reduction coincides with the usual
 qubit partial trace. For a non-contiguous $`A`$ the two differ, and MatchCake implements the
 fermionic one, which keeps the reduced state Gaussian and lets nearest-neighbour matchgates
-of the reduced system act as free-fermion hoppings between the kept modes.
+of the reduced system act as free-fermion hoppings between the kept modes. The fermionic
+partial trace has a simple meaning in terms of qubits: it is the qubit partial trace of the
+state whose traced-out wires were first moved behind the kept ones with fSWAP gates, both
+groups keeping their order. An fSWAP exchanges two neighbouring fermionic modes, so it permutes
+the Majorana indices and leaves the principal submatrix of the kept modes unchanged.
 
 ## 2. Normal modes and the pure-state decomposition
 
@@ -258,7 +262,79 @@ samples only involve $`\Lambda_A`$ and the formula of Section 3 is unchanged.
 **Gradients.** The backward pass of Section 4 applies to the odd size with one more family of
 gauge directions, the rotations between a mode of zero polarization and the kernel vector.
 
-## 6. Limitations
+## 6. Adding ancilla wires
+
+The reverse operation adds wires to a state. Let $`\rho`$ be a state of $`m`$ wires with
+covariance matrix $`\Lambda`$ and displacement $`d`$, and let $`\sigma`$ be an ancilla of $`k`$
+wires in a product state, inserted at position $`i`$ of the wire list. Call $`F`$ the $`i`$
+wires of $`\rho`$ in front of the ancilla, $`B`$ the wires of the ancilla and $`G`$ the wires
+of $`\rho`$ behind it. In the register $`(F, B, G)`$ the Jordan-Wigner strings run through the
+ancilla, and the Majorana operators are
+
+```math
+C_\mu = c_\mu \;\; (\mu \in I_F),
+\qquad
+C_\nu = P_F\, b_\nu \;\; (\nu \in I_B),
+\qquad
+C_\mu = c_\mu P_B \;\; (\mu \in I_G),
+```
+
+with $`c_\mu`$ the Majorana operators of the wires of $`\rho`$, $`b_\nu`$ those of the ancilla
+alone, and $`P_F`$, $`P_B`$ the parities of the wires of $`F`$ and of the ancilla. Since the
+tensor product is the one of the qubits, the expectation values factorize, and the covariance
+matrix $`i \langle C C \rangle`$ and the displacement $`\langle C \rangle`$ of the new state are
+
+```math
+\begin{aligned}
+\Lambda'_{FF} &= \Lambda_{FF}, \qquad \Lambda'_{GG} = \Lambda_{GG}, \qquad \Lambda'_{BB} = \Lambda^{\sigma},
+\\ \Lambda'_{FG} &= \langle P_B \rangle_\sigma\, \Lambda_{FG},
+\\ \Lambda'_{\mu\nu} &= i \langle c_\mu P_F \rangle_\rho\, \langle b_\nu \rangle_\sigma \qquad (\mu \in I_F,\ \nu \in I_B),
+\\ \Lambda'_{\nu\mu} &= i \langle b_\nu P_B \rangle_\sigma\, \langle P_F\, c_\mu \rangle_\rho \qquad (\nu \in I_B,\ \mu \in I_G),
+\\ d' &= \big( d_F,\ \langle P_F \rangle_\rho\, d^{\sigma},\ \langle P_B \rangle_\sigma\, d_G \big) .
+\end{aligned}
+```
+
+The quantities of $`\rho`$ are expectation values of Pauli words, read from its extended
+covariance matrix: $`\langle P_F \rangle`$ is a string of $`Z`$ on the wires of $`F`$,
+$`c_\mu P_F`$ is such a string ending with a $`Y`$ or an $`X`$, and $`P_F c_\mu`$ is a string
+of $`Z`$ from the first wire of $`G`$ ending with an $`X`$ or a $`Y`$. For a product state with
+Bloch vectors $`(x_l, y_l, z_l)`$, the quantities of the ancilla are
+
+```math
+\langle P_B \rangle = \prod_l z_l,
+\qquad
+i \langle b_{2l} P_B \rangle = y_l \prod_{l' > l} z_{l'},
+\qquad
+i \langle b_{2l+1} P_B \rangle = -x_l \prod_{l' > l} z_{l'},
+```
+
+next to the displacement $`d^\sigma`$ and the covariance matrix $`\Lambda^\sigma`$ of
+[the expectation-value page](expectation_values_theory.md#5-arbitrary-product-state).
+
+**When the tensor product is Gaussian.** These formulas always give the two-point functions and
+the displacement of $`\rho \otimes \sigma`$. They describe the whole state only when it is a
+(displaced) Gaussian state, and this depends on the ancilla.
+
+- *An ancilla in a computational-basis state* $`|x\rangle`$ has no displacement and a definite
+  parity $`\langle P_B \rangle = (-1)^{|x|}`$. The only effect on $`\rho`$ is this sign on the
+  Majorana operators of $`G`$, and the result is Gaussian for every state and every position.
+- *An ancilla with superposed qubits* gives a Gaussian state exactly when the wires of $`F`$
+  are in a pure state. In that case $`\rho`$ is the product of a pure state of $`F`$ and a state
+  of $`G`$, the ancilla extends the pure state of $`F`$, and the result is again the reduced
+  state of a matchgate circuit on a product state (Section 5). This covers position $`0`$ of
+  any state, every position of a product state, and the end of a pure state. When the wires
+  of $`F`$ are in a mixed state, the reduced state on $`(F, B)`$ is $`\rho_F \otimes \sigma`$,
+  which violates Wick's theorem: for one wire with Bloch vector $`r`$ in front of one ancilla
+  wire with Bloch vector $`s`$, $`\langle C_0 C_1 C_2 \rangle = i\, s_x`$ while the Pfaffian of
+  the extended covariance matrix gives $`i\, |r|^2 s_x`$.
+
+MatchCake computes the new state in the two exact cases and raises an error in the other one.
+An ancilla with superposed qubits that is needed next to wires in the middle of a mixed state
+can be inserted at position $`0`$ and moved with fSWAP gates. The result differs from the
+tensor product by the controlled-$`Z`$ part of these gates, which is a physical interaction
+between the ancilla and the wires it crosses.
+
+## 7. Limitations
 
 - The initial state of the first circuit must be a product state. For a product state with
   superposed qubits, the reduction coincides with the qubit partial trace when the kept wires
@@ -268,6 +344,8 @@ gauge directions, the rotations between a mode of zero polarization and the kern
 - The reduction is the fermionic partial trace. For a computational-basis initial state it
   equals the qubit partial trace for a contiguous block of kept wires, and differs from it by
   Jordan-Wigner strings through the traced-out wires otherwise.
+- An ancilla with superposed qubits can only be added behind wires that are in a pure state
+  (Section 6). An ancilla in a computational-basis state can be added anywhere.
 - The number of members of the pure-state decomposition grows as $`2^r`$ with the number
   $`r`$ of mixed modes, at most the number of traced-out wires. The direct evaluation does
   not have this cost.

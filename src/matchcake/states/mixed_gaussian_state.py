@@ -1,4 +1,5 @@
 import itertools
+import operator
 import warnings
 from functools import cached_property, reduce
 from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple, cast
@@ -27,7 +28,7 @@ from ..utils._pfaffian import sector_pfaffian_features
 from ..utils.covariance import block_diagonal_covariance, block_diagonalize_covariance
 from ..utils.majorana import MajoranaGetter
 from ..utils.math import complex_dtype_name_like, convert_and_cast_like, convert_like_and_cast_to, random_index
-from ..utils.torch_utils import detach
+from ..utils.torch_utils import detach, infer_real_dtype
 
 ExecutionMode = Literal["parallel", "sequential", "direct"]
 OutputType = Literal["expval", "probs", "samples"]
@@ -103,6 +104,10 @@ class MixedGaussianState:
     from :math:`\tilde\Lambda`. Probabilities and samples in the computational basis do not depend on the
     displacement.
 
+    **Adding wires.** :meth:`insert` and :meth:`append` add ancilla wires in a product state at any position
+    of the wire list, as ``list.insert`` and ``list.append`` do, and return the tensor product as a new state.
+    They are the reverse of :meth:`partial_trace`.
+
     :param covariance_matrix: Real antisymmetric matrix of shape ``(2m, 2m)`` or ``(B, 2m, 2m)``.
     :type covariance_matrix: TensorLike
     :param wires: Labels of the ``m`` wires of the state. They must be consecutive integers because
@@ -152,6 +157,32 @@ class MixedGaussianState:
         positive = values > 0
         safe = qml.math.where(positive, values, qml.math.ones_like(values))
         return qml.math.where(positive, values * qml.math.log(safe), qml.math.zeros_like(values))
+
+    @staticmethod
+    def _ancilla_product_state(ancilla: Any) -> ProductState:
+        """Return an ancilla given in any accepted form as a product state on ``range(k)``.
+
+        :param ancilla: A :class:`~matchcake.operations.state_preparation.ProductState`, a
+            :class:`~pennylane.BasisState`, one bit or a sequence of ``k`` bits, or amplitudes of shape
+            ``(k, 2)`` or ``(B, k, 2)``.
+        :type ancilla: Any
+        :return: The product state of the ``k`` ancilla wires.
+        :rtype: ProductState
+        :raises ValueError: If a scalar or one-dimensional ancilla is not made of the bits 0 and 1.
+        """
+        if isinstance(ancilla, qml.BasisState):
+            ancilla = ProductState.from_basis_state(ancilla)
+        if isinstance(ancilla, ProductState):
+            return ProductState(ancilla.data[0], wires=range(len(ancilla.wires)), validate_norm=False)
+        if qml.math.ndim(ancilla) <= 1:
+            bits = np.atleast_1d(np.asarray(ancilla))
+            if not np.all((bits == 0) | (bits == 1)):
+                raise ValueError(
+                    f"A scalar or one-dimensional ancilla is read as bits and must be made of 0 and 1, got "
+                    f"{bits.tolist()}. Pass the amplitudes of a product state with shape (k, 2) or (B, k, 2)."
+                )
+            return ProductState.from_basis_state(bits.astype(int), wires=range(len(bits)))
+        return ProductState(ancilla, wires=range(tuple(qml.math.shape(ancilla))[-2]))
 
     @classmethod
     def from_polarizations(
@@ -242,6 +273,22 @@ class MixedGaussianState:
             f"{type(self).__name__}(num_wires={self.num_wires}, batch_shape={self.batch_shape}, "
             f"num_mixed_modes={self.num_mixed_modes}, num_pure_states={self.num_pure_states}{displaced})"
         )
+
+    def append(self, ancilla: Any, *, wires: Optional[WiresLike] = None) -> "MixedGaussianState":
+        r"""
+        Add ancilla wires behind the wires of the state.
+
+        This is :meth:`insert` at the index :attr:`num_wires`, as ``list.append`` is ``list.insert`` at the end.
+
+        :param ancilla: The state of the new wires, see :meth:`insert`.
+        :type ancilla: Any
+        :param wires: Labels of the wires of the new state. Defaults to consecutive integers from the first
+            wire of this state.
+        :type wires: Optional[WiresLike]
+        :return: The state on the ``m + k`` wires.
+        :rtype: MixedGaussianState
+        """
+        return self.insert(self.num_wires, ancilla, wires=wires)
 
     def density_matrix(self) -> TensorLike:
         r"""
@@ -565,6 +612,153 @@ class MixedGaussianState:
             pfaffian_chunk_size=self.device_kwargs.get("pfaffian_chunk_size", None),
         )
 
+    def insert(self, index: int, ancilla: Any, *, wires: Optional[WiresLike] = None) -> "MixedGaussianState":
+        r"""
+        Add ancilla wires in a product state at a position of the wire list, as ``list.insert`` does.
+
+        The new state is the tensor product of this state with the ancilla, on ``m + k`` wires: the ``k``
+        ancilla wires take the positions ``index, ..., index + k - 1`` and the wires of this state that were
+        at ``index`` or behind move back by ``k``. It is the reverse of :meth:`partial_trace`: tracing the
+        inserted wires out of the result of :meth:`append` gives this state back.
+
+        The tensor product is the one of the qubits. In the Majorana operators of the ``m + k`` wires, the
+        operators of the ancilla carry the parity of the wires in front of it and the operators of the
+        wires behind it carry the parity of the ancilla, so the covariance matrix and the displacement of
+        the new state combine those of the two factors with the expectation values of these parities.
+
+        Not every tensor product is a Gaussian state, and the rule depends on the ancilla.
+
+        * An ancilla in a computational-basis state can be inserted at any index of any state.
+        * An ancilla with superposed qubits can be inserted where the wires in front of it are in a pure
+          state: at index 0 of any state, at any index of a product state, at the end of a pure state, and
+          behind a block of wires that is pure. Behind wires in a mixed state the tensor product is not a
+          Gaussian state, with or without displacement, and a ``ValueError`` is raised.
+
+        The state and the ancilla may each be batched, with the same batch size when both are.
+
+        :param index: Position of the first ancilla wire in the wire list of the new state, from ``0`` (in
+            front of every wire) to :attr:`num_wires` (behind every wire). A negative index counts from the
+            end, as for a list.
+        :type index: int
+        :param ancilla: The state of the new wires: a
+            :class:`~matchcake.operations.state_preparation.ProductState` or a :class:`~pennylane.BasisState`
+            (their wire labels are ignored), one bit or a sequence of ``k`` bits, or the amplitudes of a
+            product state with shape ``(k, 2)`` or ``(B, k, 2)``.
+        :type ancilla: Any
+        :param wires: Labels of the wires of the new state, which must be ``m + k`` consecutive integers.
+            Defaults to consecutive integers from the first wire of this state.
+        :type wires: Optional[WiresLike]
+        :return: The state on the ``m + k`` wires, with the settings of this state.
+        :rtype: MixedGaussianState
+        :raises ValueError: If the index is out of range, or if the ancilla has superposed qubits and the
+            wires in front of it are not in a pure state.
+        """
+        num_wires = self.num_wires
+        position = operator.index(index)
+        if position < 0:
+            position += num_wires
+        if not 0 <= position <= num_wires:
+            raise ValueError(
+                f"The index {index} is out of range for a {type(self).__name__} on {num_wires} wires: use an "
+                f"index between {-num_wires} and {num_wires}."
+            )
+        ancilla_state = self._ancilla_product_state(ancilla)
+        num_ancillas = len(ancilla_state.wires)
+        is_basis = bool(qml.math.all(ancilla_state.is_basis_state))
+        front_is_pure: Any = True
+        if not is_basis and position > 0:
+            front_is_pure = self.reduced_state(self.wires[:position]).is_pure
+        if not bool(np.all(front_is_pure)):
+            raise ValueError(
+                f"An ancilla with superposed qubits can only be inserted behind wires that are in a pure state. "
+                f"The {position} wires in front of index {index} are in a mixed state, so the tensor product "
+                f"is not a Gaussian state. Insert the ancilla at index 0, or use an ancilla in a "
+                f"computational-basis state, which can be inserted at any index."
+            )
+
+        covariance_matrix = self.covariance_matrix
+        amplitudes = ancilla_state.data[0]
+        real_dtype = infer_real_dtype(covariance_matrix)
+        covariance = torch.as_tensor(covariance_matrix, dtype=real_dtype)  # (..., 2m, 2m)
+        displacement = torch.as_tensor(self.displacement, dtype=real_dtype, device=covariance.device)  # (..., 2m)
+
+        # Bloch vectors of the ancilla wires, and its Majorana data with the strings of its own wires.
+        ancilla_amplitudes = torch.as_tensor(amplitudes).to(covariance.device)  # (..., k, 2)
+        coherence = torch.conj(ancilla_amplitudes[..., 0]) * ancilla_amplitudes[..., 1]
+        bloch_x = (2.0 * torch.real(coherence)).to(real_dtype)
+        bloch_y = (2.0 * torch.imag(coherence)).to(real_dtype)
+        bloch_z = (torch.abs(ancilla_amplitudes[..., 0]) ** 2 - torch.abs(ancilla_amplitudes[..., 1]) ** 2).to(
+            real_dtype
+        )
+        ones = torch.ones_like(bloch_z[..., :1])
+        strings_in_front = torch.cat([ones, torch.cumprod(bloch_z[..., :-1], dim=-1)], dim=-1)
+        reversed_z = torch.flip(bloch_z, dims=[-1])
+        strings_behind = torch.flip(torch.cat([ones, torch.cumprod(reversed_z[..., :-1], dim=-1)], dim=-1), dims=[-1])
+        ancilla_batch = tuple(bloch_z.shape[:-1])
+        ancilla_parity = torch.prod(bloch_z, dim=-1)  # <Z...Z> of the ancilla
+        # <b_nu> and i <b_nu P_B>, with b_nu the Majorana operators of the ancilla and P_B its parity.
+        ancilla_displacement = torch.stack([strings_in_front * bloch_x, strings_in_front * bloch_y], dim=-1).reshape(
+            ancilla_batch + (2 * num_ancillas,)
+        )
+        ancilla_parity_displacement = torch.stack(
+            [strings_behind * bloch_y, -strings_behind * bloch_x], dim=-1
+        ).reshape(ancilla_batch + (2 * num_ancillas,))
+        ancilla_covariance = torch.as_tensor(ancilla_state.covariance_matrix).to(
+            dtype=real_dtype, device=covariance.device
+        )  # (..., 2k, 2k)
+
+        front_size = 2 * position
+        if is_basis or position == 0:
+            # No parity string of the wires in front is needed: the ancilla has no displacement, or it has
+            # no wire in front of it.
+            front_parity = torch.ones(self.batch_shape, dtype=real_dtype, device=covariance.device)
+            front_parity_displacement = covariance.new_zeros(self.batch_shape + (front_size,))
+            behind_displacement = displacement[..., front_size:]
+        else:
+            front_parity, front_parity_displacement, behind_displacement = self._parity_string_correlators(position)
+
+        batch_shape = torch.broadcast_shapes(self.batch_shape, ancilla_batch)
+        size = 2 * (num_wires + num_ancillas)
+        front = slice(0, front_size)
+        middle = slice(front_size, front_size + 2 * num_ancillas)
+        behind = slice(front_size + 2 * num_ancillas, size)
+        parity_factor = ancilla_parity[..., None, None]
+        joint = covariance.new_zeros(batch_shape + (size, size))
+        joint[..., front, front] = covariance[..., :front_size, :front_size]
+        joint[..., behind, behind] = covariance[..., front_size:, front_size:]
+        joint[..., front, behind] = parity_factor * covariance[..., :front_size, front_size:]
+        joint[..., behind, front] = parity_factor * covariance[..., front_size:, :front_size]
+        joint[..., middle, middle] = ancilla_covariance
+        front_block = front_parity_displacement[..., :, None] * ancilla_displacement[..., None, :]  # (..., 2i, 2k)
+        joint[..., front, middle] = front_block
+        joint[..., middle, front] = -front_block.mT
+        behind_block = ancilla_parity_displacement[..., :, None] * behind_displacement[..., None, :]
+        joint[..., middle, behind] = behind_block  # (..., 2k, 2(m - i))
+        joint[..., behind, middle] = -behind_block.mT
+
+        new_displacement: Optional[TensorLike] = None
+        if self._displacement is not None or not is_basis:
+            new_displacement = torch.cat(
+                [
+                    displacement[..., :front_size].expand(batch_shape + (front_size,)),
+                    (front_parity[..., None] * ancilla_displacement).expand(batch_shape + (2 * num_ancillas,)),
+                    (ancilla_parity[..., None] * displacement[..., front_size:]).expand(
+                        batch_shape + (2 * num_wires - front_size,)
+                    ),
+                ],
+                dim=-1,
+            )
+        is_tensor = isinstance(covariance_matrix, torch.Tensor) or isinstance(amplitudes, torch.Tensor)
+        new_covariance: TensorLike = joint
+        if not is_tensor:
+            new_covariance = convert_and_cast_like(joint, covariance_matrix)
+            if new_displacement is not None:
+                new_displacement = convert_and_cast_like(new_displacement, covariance_matrix)
+        if wires is None:
+            first_label = int(self.wires.tolist()[0])
+            wires = range(first_label, first_label + num_wires + num_ancillas)
+        return self._new(new_covariance, wires=wires, source_wires=None, displacement=new_displacement)
+
     def partial_trace(self, wires: WiresLike, **kwargs) -> "MixedGaussianState":
         r"""
         Trace out the given wires and return the state of the remaining ones.
@@ -683,7 +877,9 @@ class MixedGaussianState:
                 f"fermionic partial trace: its Pauli words with an odd number of X and Y factors correspond to "
                 f"the same words multiplied by a Z on every traced-out wire in front of them, and differ from "
                 f"the qubit partial trace. Words with an even number of X and Y factors and probabilities are "
-                f"not affected. Trace out the last wires of the register to obtain the qubit partial trace.",
+                f"not affected. The result is the qubit partial trace of the state whose traced-out wires were "
+                f"first moved behind the kept wires with fSWAP gates. Trace out the last wires of the register to "
+                f"obtain the qubit partial trace of the state itself.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -912,6 +1108,47 @@ class MixedGaussianState:
         if (pauli_string.count("X") + pauli_string.count("Y")) % 2 == 0:
             return word
         return qml.prod(qml.PauliX(self.parity_wire), word)
+
+    def _parity_string_correlators(self, position: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""
+        Expectation values of the Majorana operators dressed with the parity of the first wires.
+
+        With :math:`P` the parity of the ``position`` first wires, the three results are
+        :math:`\langle P \rangle`, the vector :math:`i \langle c_\mu P \rangle` over the Majorana operators of
+        these wires, and the vector :math:`\langle P c_\mu \rangle` over those of the other wires. Each of
+        them is the expectation value of a Pauli word: a string of :math:`Z` on the first wires that ends
+        with a :math:`Y` or an :math:`X`, or a string of :math:`Z` from the wire ``position`` that ends with
+        an :math:`X` or a :math:`Y`. :meth:`insert` uses them for an ancilla with a displacement.
+
+        :param position: Number of wires in front, between ``1`` and :attr:`num_wires`.
+        :type position: int
+        :return: The parity, of shape ``(...)``, and the two vectors, of shapes ``(..., 2 * position)`` and
+            ``(..., 2 * (m - position))``.
+        :rtype: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        """
+        num_wires = self.num_wires
+        wire_map = {label: wire_position for wire_position, label in enumerate(self.wires.tolist())}
+        real_dtype = infer_real_dtype(self.covariance_matrix)
+
+        def expectation(letters: Dict[int, str]) -> torch.Tensor:
+            pauli_string = "".join(letters.get(wire_position, "I") for wire_position in range(num_wires))
+            observable = qml.pauli.string_to_pauli_word(pauli_string, wire_map=wire_map)
+            return torch.as_tensor(self.expval(observable), dtype=real_dtype)
+
+        front_parity = expectation({wire_position: "Z" for wire_position in range(position)})
+        front_terms = []
+        for wire_position in range(position):
+            string = {other: "Z" for other in range(wire_position + 1, position)}
+            front_terms.append(expectation({**string, wire_position: "Y"}))
+            front_terms.append(-expectation({**string, wire_position: "X"}))
+        behind_terms = []
+        for wire_position in range(position, num_wires):
+            string = {other: "Z" for other in range(position, wire_position)}
+            behind_terms.append(expectation({**string, wire_position: "X"}))
+            behind_terms.append(expectation({**string, wire_position: "Y"}))
+        behind_shape = self.batch_shape + (2 * (num_wires - position),)
+        behind = torch.stack(behind_terms, dim=-1) if behind_terms else front_parity.new_zeros(behind_shape)
+        return front_parity, torch.stack(front_terms, dim=-1), behind
 
     def _process_samples(
         self,

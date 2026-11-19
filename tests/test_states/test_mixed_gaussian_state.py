@@ -181,6 +181,40 @@ class TestMixedGaussianState:
         covariance = extended[..., indices[:, None], indices[None, :]]
         return MixedGaussianState(covariance, displacement=extended[..., indices, -1], source_wires=kept)
 
+    @staticmethod
+    def dense_ancilla(amplitudes) -> np.ndarray:
+        """Dense density matrix of the tensor product of single-qubit pure states.
+
+        :param amplitudes: Single-qubit amplitudes of shape ``(n_wires, 2)``.
+        :type amplitudes: np.ndarray
+        :return: Density matrix of shape ``(2^n, 2^n)``.
+        :rtype: np.ndarray
+        """
+        psi = np.ones(1, dtype=complex)
+        for qubit_amplitudes in np.asarray(amplitudes):
+            psi = np.kron(psi, qubit_amplitudes)
+        return np.outer(psi, psi.conj())
+
+    @staticmethod
+    def dense_insert(density: np.ndarray, ancilla_density: np.ndarray, index: int) -> np.ndarray:
+        """Qubit tensor product of two density matrices, with the wires of the second at position ``index``.
+
+        :param density: Density matrix of ``m`` wires.
+        :type density: np.ndarray
+        :param ancilla_density: Density matrix of the ``k`` inserted wires.
+        :type ancilla_density: np.ndarray
+        :param index: Position of the first inserted wire among the ``m + k`` wires.
+        :type index: int
+        :return: Density matrix of shape ``(2^(m + k), 2^(m + k))``.
+        :rtype: np.ndarray
+        """
+        n_wires = int(np.log2(density.shape[0]))
+        n_ancillas = int(np.log2(ancilla_density.shape[0]))
+        total = n_wires + n_ancillas
+        joint = np.kron(density, ancilla_density).reshape([2] * (2 * total))
+        order = list(range(index)) + list(range(n_wires, total)) + list(range(index, n_wires))
+        return joint.transpose(order + [total + axis for axis in order]).reshape(2**total, 2**total)
+
     @pytest.fixture
     def displaced_case(self):
         """A 5-wire circuit on a random product state reduced to the wires ``[0, 1, 2]`` with its dense reference."""
@@ -1139,4 +1173,317 @@ class TestMixedGaussianState:
         )
         torch.testing.assert_close(
             gradient_tilts, reference_gradients[1], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("index", [0, 1, 2, 3])
+    @pytest.mark.parametrize("bits", [[0], [1], [1, 0]])
+    def test_insert_basis_ancilla_into_displaced_state_matches_dense(self, displaced_case, index, bits):
+        state, reduced_density, _, _ = displaced_case
+        joint = state.insert(index, bits)
+        assert joint.num_wires == 3 + len(bits)
+        assert joint.wires.tolist() == list(range(3 + len(bits)))
+        expected = self.dense_insert(reduced_density, self.dense_ancilla(np.eye(2)[bits]), index)
+        np.testing.assert_allclose(
+            joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("index", [0, 1, 2, 3])
+    @pytest.mark.parametrize("bits", [[0], [1], [0, 1, 1]])
+    def test_insert_basis_ancilla_into_state_without_displacement_matches_dense(self, reduced_case, index, bits):
+        state, reduced_density, _, _ = reduced_case
+        joint = state.insert(index, bits)
+        assert not joint.is_displaced
+        expected = self.dense_insert(reduced_density, self.dense_ancilla(np.eye(2)[bits]), index)
+        np.testing.assert_allclose(
+            joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("n_ancillas", [1, 2])
+    @pytest.mark.parametrize("case_name", ["displaced_case", "reduced_case"])
+    def test_insert_product_ancilla_in_front_matches_dense(self, request, case_name, n_ancillas):
+        state, reduced_density, _, _ = request.getfixturevalue(case_name)
+        amplitudes = self.random_product_amplitudes(n_ancillas, np.random.default_rng(TEST_SEED + n_ancillas))
+        joint = state.insert(0, amplitudes)
+        assert joint.is_displaced
+        expected = self.dense_insert(reduced_density, self.dense_ancilla(amplitudes), 0)
+        np.testing.assert_allclose(
+            joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("index", [0, 1, 2, 3])
+    def test_insert_product_ancilla_anywhere_in_a_product_state_matches_dense(self, index):
+        rng = np.random.default_rng(TEST_SEED + 20)
+        amplitudes = self.random_product_amplitudes(3, rng)
+        ancilla = self.random_product_amplitudes(2, rng)
+        device = NonInteractingFermionicDevice(wires=3)
+        device.apply([ProductState(amplitudes, wires=range(3))])
+        state = self.displaced_from_device(device, [0, 1, 2])
+        joint = state.insert(index, ancilla)
+        expected = self.dense_insert(self.dense_ancilla(amplitudes), self.dense_ancilla(ancilla), index)
+        np.testing.assert_allclose(
+            joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        assert joint.is_pure
+
+    def test_insert_product_ancilla_behind_a_pure_block_matches_dense(self):
+        # Wires 0-1 are in a pure entangled state and wires 2-3 in a mixed state that is not correlated with
+        # them: an ancilla with superposed qubits fits in front, and right behind the pure block.
+        rng = np.random.default_rng(TEST_SEED + 21)
+        n_wires = 6
+        amplitudes = self.random_product_amplitudes(n_wires, rng)
+        operations = self.brick_wall([0, 1], 2, rng) + self.brick_wall([2, 3, 4, 5], 2, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        state = self.displaced_from_device(device, [0, 1, 2, 3])
+        psi = self.dense_product_state(amplitudes, operations, n_wires)
+        reduced_density = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [4, 5]))
+        ancilla = self.random_product_amplitudes(1, rng)
+        for index in (0, 2):
+            expected = self.dense_insert(reduced_density, self.dense_ancilla(ancilla), index)
+            np.testing.assert_allclose(
+                state.insert(index, ancilla).density_matrix(),
+                expected,
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+        for index in (1, 3, 4):
+            with pytest.raises(ValueError, match="pure state"):
+                state.insert(index, ancilla)
+
+    def test_append_product_ancilla_to_a_pure_entangled_state_matches_dense(self):
+        rng = np.random.default_rng(TEST_SEED + 22)
+        amplitudes = self.random_product_amplitudes(3, rng)
+        operations = self.brick_wall(range(3), 2, rng)
+        device = NonInteractingFermionicDevice(wires=3)
+        device.apply([ProductState(amplitudes, wires=range(3))] + operations)
+        state = self.displaced_from_device(device, [0, 1, 2])
+        psi = self.dense_product_state(amplitudes, operations, 3)
+        ancilla = self.random_product_amplitudes(2, rng)
+        joint = state.append(ancilla)
+        expected = self.dense_insert(np.outer(psi, psi.conj()), self.dense_ancilla(ancilla), 3)
+        np.testing.assert_allclose(
+            joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    @pytest.mark.parametrize("index", [1, 2, 3])
+    def test_insert_product_ancilla_behind_mixed_wires_is_rejected(self, displaced_case, index):
+        state, _, _, _ = displaced_case
+        ancilla = self.random_product_amplitudes(1, np.random.default_rng(TEST_SEED))
+        with pytest.raises(ValueError, match="pure state"):
+            state.insert(index, ancilla)
+
+    def test_append_is_insert_at_the_end(self, displaced_case):
+        state, _, _, _ = displaced_case
+        appended = state.append([1, 0])
+        inserted = state.insert(3, [1, 0])
+        assert appended.wires.tolist() == [0, 1, 2, 3, 4]
+        np.testing.assert_allclose(appended.covariance_matrix, inserted.covariance_matrix, atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(appended.displacement, inserted.displacement, atol=ATOL_MATRIX_COMPARISON)
+
+    def test_insert_counts_a_negative_index_from_the_end(self, displaced_case):
+        state, _, _, _ = displaced_case
+        np.testing.assert_allclose(
+            state.insert(-1, [1]).covariance_matrix,
+            state.insert(2, [1]).covariance_matrix,
+            atol=ATOL_MATRIX_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            state.insert(-3, [1]).covariance_matrix,
+            state.insert(0, [1]).covariance_matrix,
+            atol=ATOL_MATRIX_COMPARISON,
+        )
+
+    @pytest.mark.parametrize("index", [4, -4, 10])
+    def test_insert_rejects_an_index_out_of_range(self, displaced_case, index):
+        state, _, _, _ = displaced_case
+        with pytest.raises(ValueError, match="index"):
+            state.insert(index, [0])
+
+    def test_insert_accepts_the_forms_of_a_basis_ancilla(self, displaced_case):
+        state, _, _, _ = displaced_case
+        reference = state.insert(1, [1, 0])
+        forms = [
+            np.array([1, 0]),
+            qml.BasisState(np.array([1, 0]), wires=[7, 8]),
+            ProductState.from_basis_state(np.array([1, 0]), wires=["a", "b"]),
+            np.array([[0.0, 1.0], [1.0, 0.0]]),
+        ]
+        for ancilla in forms:
+            joint = state.insert(1, ancilla)
+            np.testing.assert_allclose(
+                joint.covariance_matrix, reference.covariance_matrix, atol=ATOL_MATRIX_COMPARISON
+            )
+            np.testing.assert_allclose(joint.displacement, reference.displacement, atol=ATOL_MATRIX_COMPARISON)
+        single = state.insert(1, 1)
+        np.testing.assert_allclose(
+            single.covariance_matrix, state.insert(1, [1]).covariance_matrix, atol=ATOL_MATRIX_COMPARISON
+        )
+
+    def test_insert_accepts_a_product_state_operation(self, displaced_case):
+        state, _, _, _ = displaced_case
+        amplitudes = self.random_product_amplitudes(2, np.random.default_rng(TEST_SEED))
+        from_array = state.insert(0, amplitudes)
+        from_operation = state.insert(0, ProductState(amplitudes, wires=[5, 6]))
+        np.testing.assert_allclose(
+            from_operation.covariance_matrix, from_array.covariance_matrix, atol=ATOL_MATRIX_COMPARISON
+        )
+        np.testing.assert_allclose(from_operation.displacement, from_array.displacement, atol=ATOL_MATRIX_COMPARISON)
+
+    def test_insert_rejects_bits_that_are_not_zero_or_one(self, displaced_case):
+        state, _, _, _ = displaced_case
+        with pytest.raises(ValueError, match="bits"):
+            state.insert(0, [0.6, 0.8])
+        with pytest.raises(ValueError, match="bits"):
+            state.insert(0, [2])
+
+    def test_insert_wires_and_settings_of_the_new_state(self):
+        covariance = block_diagonal_covariance(np.array([0.5, -1.0]))
+        state = MixedGaussianState(
+            covariance, wires=[3, 4], atol=1e-6, device_kwargs={"pfaffian_chunk_size": 4}, source_wires=[8, 9]
+        )
+        joint = state.insert(1, [1])
+        assert joint.wires.tolist() == [3, 4, 5]
+        assert joint.source_wires.tolist() == [3, 4, 5]
+        assert joint.atol == 1e-6
+        assert joint.device_kwargs == {"pfaffian_chunk_size": 4}
+        np.testing.assert_allclose(
+            np.sort(np.abs(np.asarray(joint.mode_polarizations))), [0.5, 1.0, 1.0], atol=ATOL_MATRIX_COMPARISON
+        )
+        relabeled = state.insert(1, [1], wires=[0, 1, 2])
+        assert relabeled.wires.tolist() == [0, 1, 2]
+        with pytest.raises(ValueError, match="wires"):
+            state.insert(1, [1], wires=[0, 1])
+
+    def test_insert_keeps_the_backend_of_the_state(self):
+        polarizations = np.array([0.4, -0.7])
+        system_density = np.diag([0.7 * 0.15, 0.7 * 0.85, 0.3 * 0.15, 0.3 * 0.85]).astype(complex)
+        ancilla = self.random_product_amplitudes(1, np.random.default_rng(TEST_SEED))
+        expected = self.dense_insert(system_density, self.dense_ancilla(ancilla), 0)
+        numpy_joint = MixedGaussianState.from_polarizations(polarizations).insert(0, ancilla)
+        assert isinstance(numpy_joint.covariance_matrix, np.ndarray)
+        assert isinstance(numpy_joint.displacement, np.ndarray)
+        np.testing.assert_allclose(
+            numpy_joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        torch_joint = MixedGaussianState.from_polarizations(torch.tensor(polarizations)).insert(0, ancilla)
+        assert isinstance(torch_joint.covariance_matrix, torch.Tensor)
+        assert isinstance(torch_joint.displacement, torch.Tensor)
+        np.testing.assert_allclose(
+            torch_joint.density_matrix(), expected, atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+
+    def test_insert_into_a_batched_state_matches_dense(self):
+        rng = np.random.default_rng(TEST_SEED + 23)
+        n_wires = 4
+        amplitudes = np.stack([self.random_product_amplitudes(n_wires, rng) for _ in range(3)])
+        operations = self.brick_wall(range(n_wires), 1, rng)
+        device = NonInteractingFermionicDevice(wires=n_wires)
+        device.apply([ProductState(amplitudes, wires=range(n_wires))] + operations)
+        state = self.displaced_from_device(device, [0, 1])
+        ancilla = self.random_product_amplitudes(1, rng)
+        in_front = state.insert(0, ancilla)
+        in_between = state.insert(1, [1])
+        assert in_front.batch_shape == (3,)
+        assert in_between.batch_shape == (3,)
+        for batch_index in range(3):
+            psi = self.dense_product_state(amplitudes[batch_index], operations, n_wires)
+            reduced = np.asarray(qml.math.partial_trace(np.outer(psi, psi.conj()), [2, 3]))
+            np.testing.assert_allclose(
+                np.asarray(in_front.density_matrix())[batch_index],
+                self.dense_insert(reduced, self.dense_ancilla(ancilla), 0),
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+            np.testing.assert_allclose(
+                np.asarray(in_between.density_matrix())[batch_index],
+                self.dense_insert(reduced, self.dense_ancilla(np.eye(2)[[1]]), 1),
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+
+    def test_insert_a_batch_of_ancillas_matches_dense(self, displaced_case):
+        state, reduced_density, _, _ = displaced_case
+        rng = np.random.default_rng(TEST_SEED + 24)
+        ancillas = np.stack([self.random_product_amplitudes(2, rng) for _ in range(3)])
+        joint = state.insert(0, ancillas)
+        assert joint.batch_shape == (3,)
+        for batch_index in range(3):
+            np.testing.assert_allclose(
+                np.asarray(joint.density_matrix())[batch_index],
+                self.dense_insert(reduced_density, self.dense_ancilla(ancillas[batch_index]), 0),
+                atol=ATOL_MATRIX_COMPARISON,
+                rtol=RTOL_MATRIX_COMPARISON,
+            )
+
+    def test_append_then_partial_trace_returns_the_state(self, displaced_case):
+        state, _, _, _ = displaced_case
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            recovered = state.append([1, 0]).partial_trace([3, 4])
+        np.testing.assert_allclose(recovered.covariance_matrix, state.covariance_matrix, atol=ATOL_MATRIX_COMPARISON)
+        np.testing.assert_allclose(recovered.displacement, state.displacement, atol=ATOL_MATRIX_COMPARISON)
+
+    @pytest.mark.parametrize("mode", ["parallel", "sequential", "direct"])
+    def test_circuit_on_a_state_with_an_inserted_ancilla_matches_dense(self, displaced_case, mode):
+        # One more round with a fresh ancilla: insert it, couple it to the system, and trace it out again.
+        state, reduced_density, _, _ = displaced_case
+        rng = np.random.default_rng(TEST_SEED + 25)
+        ancilla = self.random_product_amplitudes(1, rng)
+        joint = state.insert(0, ancilla)
+        operations = self.brick_wall(range(4), 1, rng)
+        unitary = self.dense_unitary(operations, 4)
+        joint_density = self.dense_insert(reduced_density, self.dense_ancilla(ancilla), 0)
+        evolved_density = unitary @ joint_density @ unitary.conj().T
+        observable = qml.PauliX(0) + 0.5 * qml.PauliZ(1) @ qml.PauliY(2) - 0.3 * qml.PauliX(2) @ qml.PauliX(3)
+        expected = np.trace(evolved_density @ qml.matrix(observable, wire_order=range(4))).real
+        np.testing.assert_allclose(
+            joint.execute(operations, observable, "expval", mode=mode),
+            expected,
+            atol=ATOL_SCALAR_COMPARISON,
+            rtol=RTOL_SCALAR_COMPARISON,
+        )
+        np.testing.assert_allclose(
+            joint.execute(operations, output_type="probs", mode=mode),
+            np.diag(evolved_density).real,
+            atol=ATOL_MATRIX_COMPARISON,
+            rtol=RTOL_MATRIX_COMPARISON,
+        )
+
+    def test_gradient_through_an_inserted_ancilla_matches_dense(self):
+        rng = np.random.default_rng(TEST_SEED + 26)
+        covariance = torch.tensor(
+            np.asarray(MixedGaussianState.from_polarizations(np.array([0.4, -0.7])).covariance_matrix),
+            dtype=torch.float64,
+        )
+        system_density = torch.tensor(np.diag([0.7 * 0.15, 0.7 * 0.85, 0.3 * 0.15, 0.3 * 0.85]), dtype=torch.complex128)
+        tilt = torch.tensor(0.9, dtype=torch.float64, requires_grad=True)
+        angles = torch.tensor(rng.normal(size=(2, 2)), dtype=torch.float64, requires_grad=True)
+        observable = qml.PauliX(0) @ qml.PauliZ(1) + 0.6 * qml.PauliY(1) @ qml.PauliX(2) - 0.8 * qml.PauliZ(2)
+
+        def ancilla_of(tilt_angle):
+            return torch.stack([torch.cos(tilt_angle / 2) + 0j, torch.sin(tilt_angle / 2) * np.exp(0.3j)])[None, :]
+
+        def build(parameters):
+            return [CompRxRx(parameters[0], wires=[0, 1]), CompRyRy(parameters[1], wires=[1, 2])]
+
+        state = MixedGaussianState(covariance).insert(0, ancilla_of(tilt))
+        value = state.execute(build(angles), observable, "expval", mode="direct")
+        gradient_tilt, gradient_angles = torch.autograd.grad(value, (tilt, angles))
+
+        reference_tilt = tilt.detach().clone().requires_grad_()
+        reference_angles = angles.detach().clone().requires_grad_()
+        ancilla_vector = ancilla_of(reference_tilt)[0]
+        joint_density = torch.kron(torch.outer(ancilla_vector, ancilla_vector.conj()), system_density)
+        unitary = qml.matrix(qml.tape.QuantumScript(build(reference_angles)), wire_order=range(3))
+        evolved = unitary @ joint_density @ unitary.conj().T
+        reference = torch.trace(evolved @ torch.tensor(qml.matrix(observable, wire_order=range(3)))).real
+        reference_gradients = torch.autograd.grad(reference, (reference_tilt, reference_angles))
+        torch.testing.assert_close(
+            value.detach(), reference.detach(), atol=ATOL_SCALAR_COMPARISON, rtol=RTOL_SCALAR_COMPARISON
+        )
+        torch.testing.assert_close(
+            gradient_tilt, reference_gradients[0], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
+        )
+        torch.testing.assert_close(
+            gradient_angles, reference_gradients[1], atol=ATOL_MATRIX_COMPARISON, rtol=RTOL_MATRIX_COMPARISON
         )
